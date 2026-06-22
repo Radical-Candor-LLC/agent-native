@@ -1,0 +1,91 @@
+name: Sync with upstream
+
+# Weekly check for new commits on the upstream framework
+# (BuilderIO/agent-native@main). When upstream is ahead and no sync PR is already
+# open, this merges upstream into a rolling branch and opens a PR into main so the
+# upstream delta can be reviewed before it lands. Run on demand from the Actions
+# tab -> "Sync with upstream" -> "Run workflow".
+#
+# Requires: Settings -> Actions -> General -> "Allow GitHub Actions to create and
+# approve pull requests" must be enabled, or `gh pr create` is blocked even with
+# the pull-requests:write permission below.
+
+on:
+  schedule:
+    - cron: "0 14 * * 1" # Mondays 14:00 UTC (~6-7am PT). Edit to change cadence.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Open the upstream sync PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream and open a sync PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_URL: https://github.com/BuilderIO/agent-native.git
+          SYNC_BRANCH: automated/upstream-sync
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --quiet upstream main
+
+          behind="$(git rev-list --count origin/main..upstream/main)"
+          if [ "$behind" -eq 0 ]; then
+            echo "Fork is already up to date with upstream/main. Nothing to do."
+            exit 0
+          fi
+          echo "upstream/main is ahead by $behind commit(s)."
+
+          # Leave an open sync PR alone (it may be mid-review / mid-conflict-fix);
+          # the next run after it merges will pick up any newer upstream commits.
+          existing="$(gh pr list --head "$SYNC_BRANCH" --base main --state open \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "PR #$existing is already open for $SYNC_BRANCH; leaving it for review."
+            exit 0
+          fi
+
+          # No open PR: build a fresh sync branch from origin/main + upstream/main.
+          git switch -C "$SYNC_BRANCH" origin/main
+          if git merge --no-edit upstream/main; then
+            status="✅ Merged \`upstream/main\` cleanly ($behind commit(s) ahead)."
+          else
+            git merge --abort
+            git reset --hard upstream/main
+            status="⚠️ **Merge conflicts** — this branch was reset to \`upstream/main\` so the delta is visible, but GitHub cannot auto-merge it. Resolve locally: \`git fetch upstream && git switch main && git merge upstream/main\`, fix conflicts, commit, push."
+          fi
+
+          # Safe to force: there is no open PR, so nothing in flight to clobber.
+          git push --force origin "$SYNC_BRANCH"
+
+          {
+            echo "$status"
+            echo
+            echo "Automated weekly sync from \`BuilderIO/agent-native@main\`."
+            echo
+            echo "- **Merge, don't squash** when landing — preserves upstream's commit history so future syncs stay clean."
+            echo "- Syncing the repo does **not** update the live deploy. After merge, rebuild the image and run \`gcloud run services replace\` per \`deploy/README.md\` to ship upstream's changes to the running Plan service."
+          } > "$RUNNER_TEMP/sync-pr-body.md"
+
+          gh pr create --base main --head "$SYNC_BRANCH" \
+            --title "chore: sync fork with upstream (BuilderIO/agent-native)" \
+            --body-file "$RUNNER_TEMP/sync-pr-body.md"
