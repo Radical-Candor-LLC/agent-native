@@ -97,7 +97,8 @@ pub fn run() {
             native_speech::native_speech_request_permission,
             // native full-screen recording (macOS screencapture, no picker)
             native_screen::native_fullscreen_recording_available,
-            native_screen::native_fullscreen_recording_start,
+            native_screen::native_fullscreen_recording_warm,
+            native_screen::native_fullscreen_recording_begin,
             native_screen::native_fullscreen_capture_thumbnail,
             native_screen::native_fullscreen_recording_stop_and_upload,
             native_screen::native_fullscreen_recording_stop_and_save,
@@ -155,6 +156,9 @@ pub fn run() {
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .app_name("Clips")
+                // Tag login-launched processes so startup can stay quiet in the
+                // tray, while a manual launch auto-opens the popover.
+                .args(["--autostart"])
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -302,6 +306,14 @@ pub fn run() {
                         }
                     }
                 });
+            }
+
+            // Auto-open the popover on a manual launch so the app doesn't sit
+            // silently in the tray waiting for a click. Skipped when launched at
+            // login (tagged with `--autostart`) so it doesn't pop up every boot.
+            let launched_at_login = std::env::args().any(|arg| arg == "--autostart");
+            if !launched_at_login {
+                toggle_popover(app.handle());
             }
 
             Ok(())

@@ -1,5 +1,27 @@
 # @agent-native/core
 
+## 0.66.7
+
+### Patch Changes
+
+- 3d7df7d: Normalize exhausted provider rate-limit errors in agent chat and keep raw 429
+  provider messages in diagnostics instead of the primary UI copy.
+- 3d7df7d: Dismiss code annotation hover cards on layout changes and outside interactions.
+
+## 0.66.6
+
+### Patch Changes
+
+- 337bcc5: Fix visual plan layout polish: compact question previews, mark wide-eligible tabs for diff-like content, align drag handles with wide blocks, and theme custom HTML iframes for dark mode.
+- 337bcc5: Move the sidebar Connect AI setup card above the composer and stack its actions.
+- 337bcc5: Keep the wireframe style toggle outside the Rough.js measurement scope so sketch mode no longer draws a ghost outline for the hidden Clean button.
+
+## 0.66.5
+
+### Patch Changes
+
+- c650d44: Fix `agent-native code` crashing with `Unknown engine: "codex-cli"` when the Codex CLI runner is selected via the `AGENT_ENGINE` environment variable. The Codex branch in `executeCodeAgentRun` now falls back to `AGENT_ENGINE` the same way `resolveExecutorEngine` already does, so `AGENT_ENGINE=codex-cli` routes to the Codex CLI runner instead of being handed to the LLM-provider engine resolver (which only knows the AI-SDK providers).
+
 ## 0.66.4
 
 ### Patch Changes
