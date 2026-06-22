@@ -138,26 +138,33 @@ VM running `cloudflared`, letting the app scale to zero with request-based billi
   `an.radicalcandor.com`; identity provider Google Workspace; policy **Allow**
   email domain `radicalcandor.com`, default **Deny**.
 
-## Sign in with Google (Better Auth) — wired
+## Sign in with Google — wired
 
 `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` are set on the `app` container (from
-secrets `plan-google-client-id` / `plan-google-client-secret`), so Better Auth
-serves a one-click "Continue with Google".
+secrets `plan-google-client-id` / `plan-google-client-secret`), enabling the
+framework's Google sign-in.
 
-The RC Google OAuth 2.0 **Web** client must list this **exact** authorized redirect
-URI — note the order is `callback/google`, **not** `google/callback`:
+The framework has **two** Google flows on the same client/secret with **different**
+redirect URIs:
+
+- **Core flow — what Plan's login button actually uses:**
+  `https://an.radicalcandor.com/_agent-native/google/callback`
+- Better Auth social flow (not used by Plan's UI):
+  `https://an.radicalcandor.com/_agent-native/auth/ba/callback/google`
+
+The RC Google OAuth 2.0 **Web** client must list the **exact** redirect URI for the
+flow in use. Plan's UI uses the **core** flow, so register:
 
 ```
-https://an.radicalcandor.com/_agent-native/auth/ba/callback/google
+https://an.radicalcandor.com/_agent-native/google/callback
 ```
 
-A mismatch yields Google's `redirect_uri_mismatch` at sign-in. Verify the live
-value any time via the proxy:
+A mismatch yields Google's `redirect_uri_mismatch`. Verify the live value (the URI
+the login button sends) via the proxy:
 
 ```bash
 gcloud run services proxy plan --region us-central1 --port 8089 &
-curl -sS -X POST -H 'Content-Type: application/json' -d '{"provider":"google","callbackURL":"/"}' \
-  http://localhost:8089/_agent-native/auth/ba/sign-in/social   # url -> accounts.google.com, redirect_uri=.../callback/google
+curl -sS http://localhost:8089/_agent-native/google/auth-url   # redirect_uri=.../_agent-native/google/callback
 kill %1
 ```
 

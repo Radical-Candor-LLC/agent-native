@@ -73,9 +73,11 @@ spec:
             secretKeyRef:
               key: latest
               name: plan-oauth-state-secret
-        # Better Auth auto-enables "Continue with Google" when both are present.
-        # Google OAuth client redirect URI must be:
-        #   https://an.radicalcandor.com/_agent-native/auth/ba/callback/google
+        # Setting both enables Google sign-in. Plan's login button uses the CORE
+        # framework flow (/_agent-native/google/*), so the OAuth client must
+        # authorize this exact redirect URI:
+        #   https://an.radicalcandor.com/_agent-native/google/callback
+        # (Better Auth's separate social route is /_agent-native/auth/ba/callback/google.)
         - name: GOOGLE_CLIENT_ID
           valueFrom:
             secretKeyRef:
