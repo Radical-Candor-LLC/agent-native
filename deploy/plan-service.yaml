@@ -35,92 +35,92 @@ spec:
       annotations:
         run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
         run.googleapis.com/vpc-access-egress: private-ranges-only
-        run.googleapis.com/cpu-throttling: 'false'
-        run.googleapis.com/startup-cpu-boost: 'true'
-        autoscaling.knative.dev/minScale: '1'
+        run.googleapis.com/cpu-throttling: "false"
+        run.googleapis.com/startup-cpu-boost: "true"
+        autoscaling.knative.dev/minScale: "1"
     spec:
       containerConcurrency: 80
       timeoutSeconds: 300
       serviceAccountName: 225445667029-compute@developer.gserviceaccount.com
       containers:
-      - name: app
-        image: us-central1-docker.pkg.dev/radical-candor-ai/cloud-run-source-deploy/plan@sha256:b5be895402ec3c2158887efe7c02104b199d2b52065005129c157520cf6de31b
-        ports:
-        - containerPort: 8080
-          name: http1
-        env:
-        - name: BETTER_AUTH_URL
-          value: https://an.radicalcandor.com
-        - name: PLAN_RECAP_APP_URL
-          value: https://an.radicalcandor.com
-        - name: DATABASE_URL
-          valueFrom:
-            secretKeyRef:
-              key: latest
-              name: plan-database-url
-        - name: ANTHROPIC_API_KEY
-          valueFrom:
-            secretKeyRef:
-              key: latest
-              name: plan-anthropic-key
-        - name: BETTER_AUTH_SECRET
-          valueFrom:
-            secretKeyRef:
-              key: latest
-              name: plan-better-auth-secret
-        - name: OAUTH_STATE_SECRET
-          valueFrom:
-            secretKeyRef:
-              key: latest
-              name: plan-oauth-state-secret
-        # Setting both enables Google sign-in. Plan's login button uses the CORE
-        # framework flow (/_agent-native/google/*), so the OAuth client must
-        # authorize this exact redirect URI:
-        #   https://an.radicalcandor.com/_agent-native/google/callback
-        # (Better Auth's separate social route is /_agent-native/auth/ba/callback/google.)
-        - name: GOOGLE_CLIENT_ID
-          valueFrom:
-            secretKeyRef:
-              key: latest
-              name: plan-google-client-id
-        - name: GOOGLE_CLIENT_SECRET
-          valueFrom:
-            secretKeyRef:
-              key: latest
-              name: plan-google-client-secret
-        resources:
-          limits:
-            cpu: '900m'
-            memory: 1Gi
-        startupProbe:
-          tcpSocket:
-            port: 8080
-          failureThreshold: 1
-          periodSeconds: 240
-          timeoutSeconds: 240
-      - name: cloudflared
-        image: cloudflare/cloudflared:latest
-        # Override the image entrypoint so our args aren't appended to the
-        # baked-in ["cloudflared","--no-autoupdate"] (which mangles them).
-        command:
-        - cloudflared
-        args:
-        - tunnel
-        - run
-        env:
-        - name: TUNNEL_TOKEN
-          valueFrom:
-            secretKeyRef:
-              key: latest
-              name: plan-tunnel-token
-        # Cloud Run blocks outbound UDP/QUIC (7844), so force the tunnel onto
-        # HTTP/2 transport. Without this cloudflared retries QUIC and fails.
-        - name: TUNNEL_TRANSPORT_PROTOCOL
-          value: http2
-        resources:
-          limits:
-            cpu: '100m'
-            memory: 256Mi
+        - name: app
+          image: us-central1-docker.pkg.dev/radical-candor-ai/cloud-run-source-deploy/plan@sha256:b5be895402ec3c2158887efe7c02104b199d2b52065005129c157520cf6de31b
+          ports:
+            - containerPort: 8080
+              name: http1
+          env:
+            - name: BETTER_AUTH_URL
+              value: https://an.radicalcandor.com
+            - name: PLAN_RECAP_APP_URL
+              value: https://an.radicalcandor.com
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: plan-database-url
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: plan-anthropic-key
+            - name: BETTER_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: plan-better-auth-secret
+            - name: OAUTH_STATE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: plan-oauth-state-secret
+            # Setting both enables Google sign-in. Plan's login button uses the CORE
+            # framework flow (/_agent-native/google/*), so the OAuth client must
+            # authorize this exact redirect URI:
+            #   https://an.radicalcandor.com/_agent-native/google/callback
+            # (Better Auth's separate social route is /_agent-native/auth/ba/callback/google.)
+            - name: GOOGLE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: plan-google-client-id
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: plan-google-client-secret
+          resources:
+            limits:
+              cpu: "900m"
+              memory: 1Gi
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            failureThreshold: 1
+            periodSeconds: 240
+            timeoutSeconds: 240
+        - name: cloudflared
+          image: cloudflare/cloudflared:latest
+          # Override the image entrypoint so our args aren't appended to the
+          # baked-in ["cloudflared","--no-autoupdate"] (which mangles them).
+          command:
+            - cloudflared
+          args:
+            - tunnel
+            - run
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: plan-tunnel-token
+            # Cloud Run blocks outbound UDP/QUIC (7844), so force the tunnel onto
+            # HTTP/2 transport. Without this cloudflared retries QUIC and fails.
+            - name: TUNNEL_TRANSPORT_PROTOCOL
+              value: http2
+          resources:
+            limits:
+              cpu: "100m"
+              memory: 256Mi
   traffic:
-  - latestRevision: true
-    percent: 100
+    - latestRevision: true
+      percent: 100

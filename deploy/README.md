@@ -27,16 +27,16 @@ for the full rationale.
 
 ## Environment
 
-| Thing | Value |
-|---|---|
-| GCP project | `radical-candor-ai` |
-| Region | `us-central1` |
-| Service | `plan` |
-| Runtime SA | `225445667029-compute@developer.gserviceaccount.com` |
-| Image repo | `us-central1-docker.pkg.dev/radical-candor-ai/cloud-run-source-deploy/plan` |
-| Hostname | `an.radicalcandor.com` |
-| Neon project | `red-feather-11884863` (pooled URL → `plan-database-url` secret) |
-| Cloudflare Tunnel | `agent-native-plans` (token → `plan-tunnel-token` secret) |
+| Thing             | Value                                                                       |
+| ----------------- | --------------------------------------------------------------------------- |
+| GCP project       | `radical-candor-ai`                                                         |
+| Region            | `us-central1`                                                               |
+| Service           | `plan`                                                                      |
+| Runtime SA        | `225445667029-compute@developer.gserviceaccount.com`                        |
+| Image repo        | `us-central1-docker.pkg.dev/radical-candor-ai/cloud-run-source-deploy/plan` |
+| Hostname          | `an.radicalcandor.com`                                                      |
+| Neon project      | `red-feather-11884863` (pooled URL → `plan-database-url` secret)            |
+| Cloudflare Tunnel | `agent-native-plans` (token → `plan-tunnel-token` secret)                   |
 
 ## Files
 
@@ -48,13 +48,13 @@ for the full rationale.
 
 The app reads these via `secretKeyRef` in `plan-service.yaml`. Never commit values.
 
-| Secret | Contents |
-|---|---|
-| `plan-database-url` | Neon **pooled** connection string |
-| `plan-anthropic-key` | Anthropic API key |
+| Secret                    | Contents                                                                  |
+| ------------------------- | ------------------------------------------------------------------------- |
+| `plan-database-url`       | Neon **pooled** connection string                                         |
+| `plan-anthropic-key`      | Anthropic API key                                                         |
 | `plan-better-auth-secret` | stable 32-byte hex (`openssl rand -hex 32`) — must persist across deploys |
-| `plan-oauth-state-secret` | 32-byte hex |
-| `plan-tunnel-token` | Cloudflare Tunnel token for `agent-native-plans` |
+| `plan-oauth-state-secret` | 32-byte hex                                                               |
+| `plan-tunnel-token`       | Cloudflare Tunnel token for `agent-native-plans`                          |
 
 Create + grant (repeat per secret):
 
