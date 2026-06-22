@@ -138,6 +138,44 @@ VM running `cloudflared`, letting the app scale to zero with request-based billi
   `an.radicalcandor.com`; identity provider Google Workspace; policy **Allow**
   email domain `radicalcandor.com`, default **Deny**.
 
+## Remote MCP behind Cloudflare Access
+
+Plan exposes a remote MCP server at `/_agent-native/mcp` that **authenticates
+itself** with standard MCP OAuth (RFC 9728): unauthenticated calls get `401 +
+WWW-Authenticate: Bearer resource_metadata=…/.well-known/oauth-protected-resource`,
+and clients mint a per-user, scoped, revocable bearer via `/_agent-native/mcp/oauth/*`.
+
+Cloudflare Access in front of this path **breaks** the handshake: the MCP client
+expects the app's `401 Bearer` challenge but instead gets Access's `302 → SSO HTML`,
+and fails with `cannot parse json`. Two OAuth layers collide.
+
+Fix — exempt **only** the MCP + OAuth-discovery paths from Access (the app still
+secures them). Access policies are per-application, not per-path, so a path bypass
+must be a **separate, more-specific Access application** (most-specific path wins)
+with a **Bypass** policy covering, on `an.radicalcandor.com`:
+
+```
+/_agent-native/mcp
+/.well-known/oauth-protected-resource
+/.well-known/oauth-authorization-server
+```
+
+Then authenticate the connector — in Claude Code: `/mcp → plan → Authenticate`
+(or `npx -y @agent-native/core@latest reconnect https://an.radicalcandor.com`).
+
+Stays internal-only: the MCP endpoint requires a bearer, and minting one runs
+through the app login, whose routes remain behind Access. Verify the scoping:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST https://an.radicalcandor.com/_agent-native/mcp  # 401 (app), not 302
+curl -s -o /dev/null -w "%{http_code}\n" https://an.radicalcandor.com/                           # 302 -> Access (still gated)
+```
+
+Alternative (keep Access on MCP): add a **Service Auth** policy to the existing
+app + a Cloudflare service token, and pass `CF-Access-Client-Id` / `CF-Access-Client-Secret`
+headers on the `plan` server in `~/.claude.json`. Keeps the perimeter, but means
+double-auth (service token **and** the app bearer).
+
 ## Sign in with Google — wired
 
 `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` are set on the `app` container (from
