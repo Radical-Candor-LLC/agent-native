@@ -1,0 +1,12 @@
+# Keep the Cloud Build upload + image small and force clean linux installs.
+.git
+**/node_modules
+**/.output
+**/dist
+**/build
+**/.wrangler
+.video-bakeoff
+**/*.log
+# Never ship local env files into the image — secrets come from Cloud Run.
+**/.env
+**/.env.*
