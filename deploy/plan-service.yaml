@@ -1,0 +1,126 @@
+# Cloud Run service spec for the agent-native "plan" template (RC self-host PoC).
+#
+# This is the SOURCE OF TRUTH for the multi-container Cloud Run service. The
+# `gcloud run deploy --source` path only supports a single container, so the
+# cloudflared sidecar (the Cloudflare Tunnel that fronts the private service)
+# requires this declarative spec. Deploy with:
+#
+#   gcloud run services replace deploy/plan-service.yaml --region us-central1
+#
+# Architecture: Browser -> Cloudflare Access (Google Workspace SSO) -> Cloudflare
+# Tunnel -> this (private) Cloud Run service. The `cloudflared` sidecar dials OUT
+# to Cloudflare (no inbound port is opened), so the service stays private with
+# ingress unauthenticated callers blocked. See deploy/README.md for the full
+# build/deploy/verify/rollback runbook and the Secret Manager prerequisites.
+#
+# Resource sizing: total instance CPU is 1 vCPU (Cloud Run requires an integer
+# >= 1 vCPU when CPU is always-allocated, which the tunnel needs), split app 0.9
+# + cloudflared 0.1. At 0.9 vCPU the app memory limit is capped at 1Gi by Cloud
+# Run's per-container CPU:memory rule. minScale=1 + cpu-throttling=false keep the
+# tunnel connection alive between requests (the always-on cost driver).
+#
+# The image below is pinned by digest. After rebuilding (see deploy/README.md),
+# update the digest here and re-run `services replace`.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: plan
+  labels:
+    cloud.googleapis.com/location: us-central1
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+        run.googleapis.com/cpu-throttling: 'false'
+        run.googleapis.com/startup-cpu-boost: 'true'
+        autoscaling.knative.dev/minScale: '1'
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      serviceAccountName: 225445667029-compute@developer.gserviceaccount.com
+      containers:
+      - name: app
+        image: us-central1-docker.pkg.dev/radical-candor-ai/cloud-run-source-deploy/plan@sha256:b5be895402ec3c2158887efe7c02104b199d2b52065005129c157520cf6de31b
+        ports:
+        - containerPort: 8080
+          name: http1
+        env:
+        - name: BETTER_AUTH_URL
+          value: https://an.radicalcandor.com
+        - name: PLAN_RECAP_APP_URL
+          value: https://an.radicalcandor.com
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: plan-database-url
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: plan-anthropic-key
+        - name: BETTER_AUTH_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: plan-better-auth-secret
+        - name: OAUTH_STATE_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: plan-oauth-state-secret
+        # Setting both enables Google sign-in. Plan's login button uses the CORE
+        # framework flow (/_agent-native/google/*), so the OAuth client must
+        # authorize this exact redirect URI:
+        #   https://an.radicalcandor.com/_agent-native/google/callback
+        # (Better Auth's separate social route is /_agent-native/auth/ba/callback/google.)
+        - name: GOOGLE_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: plan-google-client-id
+        - name: GOOGLE_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: plan-google-client-secret
+        resources:
+          limits:
+            cpu: '900m'
+            memory: 1Gi
+        startupProbe:
+          tcpSocket:
+            port: 8080
+          failureThreshold: 1
+          periodSeconds: 240
+          timeoutSeconds: 240
+      - name: cloudflared
+        image: cloudflare/cloudflared:latest
+        # Override the image entrypoint so our args aren't appended to the
+        # baked-in ["cloudflared","--no-autoupdate"] (which mangles them).
+        command:
+        - cloudflared
+        args:
+        - tunnel
+        - run
+        env:
+        - name: TUNNEL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: plan-tunnel-token
+        # Cloud Run blocks outbound UDP/QUIC (7844), so force the tunnel onto
+        # HTTP/2 transport. Without this cloudflared retries QUIC and fails.
+        - name: TUNNEL_TRANSPORT_PROTOCOL
+          value: http2
+        resources:
+          limits:
+            cpu: '100m'
+            memory: 256Mi
+  traffic:
+  - latestRevision: true
+    percent: 100

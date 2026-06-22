@@ -5,6 +5,9 @@ dist
 docs/superpowers
 .DS_Store
 
+# Neon CLI local context
+.neon
+
 /*.png
 tmp/
 
