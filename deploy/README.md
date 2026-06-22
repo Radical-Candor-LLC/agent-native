@@ -138,19 +138,28 @@ VM running `cloudflared`, letting the app scale to zero with request-based billi
   `an.radicalcandor.com`; identity provider Google Workspace; policy **Allow**
   email domain `radicalcandor.com`, default **Deny**.
 
-## Pending: "Sign in with Google" (Better Auth)
+## Sign in with Google (Better Auth) — wired
 
-The app auto-enables Google social login when `GOOGLE_CLIENT_ID` +
-`GOOGLE_CLIENT_SECRET` are present. Remaining (operator) step:
+`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` are set on the `app` container (from
+secrets `plan-google-client-id` / `plan-google-client-secret`), so Better Auth
+serves a one-click "Continue with Google".
 
-1. In the RC Google Cloud project, create an **OAuth 2.0 Client ID** (Web).
-2. Authorized redirect URI (exact):
-   `https://an.radicalcandor.com/_agent-native/auth/ba/google/callback`
-3. Store the values as secrets `plan-google-client-id` / `plan-google-client-secret`
-   (grant the runtime SA `secretAccessor`), add `GOOGLE_CLIENT_ID` /
-   `GOOGLE_CLIENT_SECRET` env (from those secrets) to the `app` container in
-   `plan-service.yaml`, and re-run `services replace`.
+The RC Google OAuth 2.0 **Web** client must list this **exact** authorized redirect
+URI — note the order is `callback/google`, **not** `google/callback`:
+
+```
+https://an.radicalcandor.com/_agent-native/auth/ba/callback/google
+```
+
+A mismatch yields Google's `redirect_uri_mismatch` at sign-in. Verify the live
+value any time via the proxy:
+
+```bash
+gcloud run services proxy plan --region us-central1 --port 8089 &
+curl -sS -X POST -H 'Content-Type: application/json' -d '{"provider":"google","callbackURL":"/"}' \
+  http://localhost:8089/_agent-native/auth/ba/sign-in/social   # url -> accounts.google.com, redirect_uri=.../callback/google
+kill %1
+```
 
 Note: Cloudflare Access already enforces Google Workspace SSO at the perimeter, so
-this is a second, app-level Google login (one-click "Continue with Google" instead
-of Better Auth email/password). Email/password works today without it.
+this is a second, app-level Google login. Better Auth email/password also works.

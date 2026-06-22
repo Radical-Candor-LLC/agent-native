@@ -73,6 +73,19 @@ spec:
             secretKeyRef:
               key: latest
               name: plan-oauth-state-secret
+        # Better Auth auto-enables "Continue with Google" when both are present.
+        # Google OAuth client redirect URI must be:
+        #   https://an.radicalcandor.com/_agent-native/auth/ba/callback/google
+        - name: GOOGLE_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: plan-google-client-id
+        - name: GOOGLE_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: plan-google-client-secret
         resources:
           limits:
             cpu: '900m'
