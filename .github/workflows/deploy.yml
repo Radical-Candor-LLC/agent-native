@@ -1,0 +1,85 @@
+name: Deploy Plan to Cloud Run
+
+# Manual, deliberate deploy of the self-hosted Plan service. Kept separate from
+# the upstream-sync flow on purpose: merging a sync PR updates the repo, but
+# shipping to the live service is an explicit click here.
+#
+# Auth is via Workload Identity Federation (no long-lived service-account key).
+# Reads two repo variables (Settings -> Secrets and variables -> Actions ->
+# Variables), already configured for this repo:
+#   GCP_WORKLOAD_IDENTITY_PROVIDER
+#     projects/<num>/locations/global/workloadIdentityPools/github-actions/providers/github
+#   GCP_DEPLOY_SA
+#     github-deploy-plan@radical-candor-ai.iam.gserviceaccount.com
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build & deploy"
+        required: false
+        default: main
+
+permissions:
+  contents: read
+  id-token: write # required for WIF OIDC
+
+concurrency:
+  group: deploy-plan
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: radical-candor-ai
+  REGION: us-central1
+  SERVICE: plan
+  REPO: us-central1-docker.pkg.dev/radical-candor-ai/cloud-run-source-deploy/plan
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          project_id: radical-candor-ai
+
+      - name: Build and push image
+        id: image
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          TAG="${GITHUB_SHA::12}"
+          docker build -t "${REPO}:${TAG}" .
+          docker push "${REPO}:${TAG}"
+          DIGEST="$(gcloud artifacts docker images describe "${REPO}:${TAG}" \
+            --project "$GCP_PROJECT" --format='value(image_summary.digest)')"
+          echo "ref=${REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Built ${REPO}@${DIGEST}"
+
+      - name: Apply manifest with the new image
+        run: |
+          set -euo pipefail
+          TMP="$(mktemp)"
+          sed -E "s#(image: )${REPO}@sha256:[0-9a-f]+#\1${{ steps.image.outputs.ref }}#" \
+            deploy/plan-service.yaml > "$TMP"
+          gcloud run services replace "$TMP" --region "$REGION" --project "$GCP_PROJECT"
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          gcloud run services describe "$SERVICE" --region "$REGION" --project "$GCP_PROJECT" \
+            --format='value(status.latestReadyRevisionName)'
+          code="$(curl -sS -o /dev/null -w '%{http_code}' https://an.radicalcandor.com/ || true)"
+          echo "https://an.radicalcandor.com/ -> HTTP ${code} (302 = live behind Access)"
