@@ -1,14 +1,17 @@
 // @vitest-environment happy-dom
 
-import { describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
+import { describe, expect, it } from "vitest";
+
 import {
   canSubmitComposerContent,
   createTiptapComposerExtensions,
   displayableComposerModeMessage,
   getComposerSubmitIntentForEnterKey,
+  getOversizedDocumentAttachmentError,
   handleComposerFileDrop,
   insertComposerHardBreakAndScrollIntoView,
+  MODEL_SELECTOR_POPOVER_STYLE,
 } from "./TiptapComposer.js";
 
 describe("createTiptapComposerExtensions", () => {
@@ -70,6 +73,33 @@ describe("createTiptapComposerExtensions", () => {
         attachmentCount: 1,
       }),
     ).toBe("Create an extension: Use the attached context.");
+  });
+
+  it("detects oversized PDF attachments before submit", () => {
+    const file = new File([new Uint8Array(4 * 1024 * 1024 + 1)], "large.pdf", {
+      type: "application/pdf",
+    });
+
+    expect(
+      getOversizedDocumentAttachmentError([
+        {
+          type: "document",
+          name: "large.pdf",
+          contentType: "application/pdf",
+          file,
+        },
+      ]),
+    ).toContain('"large.pdf" is 4.0 MB — PDFs are capped at 4 MB');
+    expect(
+      getOversizedDocumentAttachmentError([
+        {
+          type: "image",
+          name: "large.png",
+          contentType: "image/png",
+          file,
+        },
+      ]),
+    ).toBeNull();
   });
 
   it("maps Enter keybindings to immediate and queued submit intents", () => {
@@ -150,5 +180,14 @@ describe("createTiptapComposerExtensions", () => {
     expect(stopped).toBe(true);
     expect(added).toHaveLength(1);
     expect(added[0]?.name).toMatch(/^\d+-[a-z0-9]+-image\.png$/);
+  });
+
+  it("caps the model picker height without forcing empty vertical space", () => {
+    expect(MODEL_SELECTOR_POPOVER_STYLE).toMatchObject({
+      fontSize: 13,
+      maxHeight:
+        "min(500px, var(--radix-popover-content-available-height, 500px))",
+    });
+    expect(MODEL_SELECTOR_POPOVER_STYLE).not.toHaveProperty("height");
   });
 });

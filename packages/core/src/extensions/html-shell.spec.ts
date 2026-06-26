@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { describe, expect, it } from "vitest";
+
 import {
   buildExtensionHtml,
   EXTENSION_FRAME_ANCESTORS,
@@ -122,6 +124,10 @@ describe("buildExtensionHtml", () => {
 
     expect(html).toContain('id="__extension-error-dismiss"');
     expect(html).toContain("agent-native-extension-error-fix");
+    expect(html).toContain("function _renderErrorToast()");
+    expect(html).toMatch(
+      /DOMContentLoaded', function\(\) \{\s+_renderErrorToast\(\);/,
+    );
     expect(
       html.match(/__extension-error-toast'\)\.style\.display = 'none'/g),
     ).toHaveLength(2);

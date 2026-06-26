@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import type { CalendarEvent } from "@shared/api";
+import { IconAlertTriangleFilled } from "@tabler/icons-react";
 import {
   startOfWeek,
   endOfWeek,
@@ -15,22 +16,23 @@ import {
   addMinutes,
   min,
 } from "date-fns";
-import { cn } from "@/lib/utils";
-import { shouldSuppressAfterPopoverClose } from "@/lib/popover-click-guard";
-import { EventStatusIcon } from "@/lib/rsvp-status";
-import { getEventDisplayColor, allOtherDeclined } from "@/lib/event-colors";
-import { IconAlertTriangleFilled } from "@tabler/icons-react";
-import { EventDetailPopover } from "./EventDetailPopover";
-import type { CalendarEvent } from "@shared/api";
-import { useEventDrag } from "@/hooks/use-event-drag";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+
 import { useCalendarContext } from "@/components/layout/AppLayout";
-import { useIsMobile } from "@/hooks/use-mobile";
-import { useViewPreferences } from "@/hooks/use-view-preferences";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useEventDrag } from "@/hooks/use-event-drag";
+import { useIsMobile } from "@/hooks/use-mobile";
+import { useViewPreferences } from "@/hooks/use-view-preferences";
+import { getEventDisplayColor, allOtherDeclined } from "@/lib/event-colors";
+import { shouldSuppressAfterPopoverClose } from "@/lib/popover-click-guard";
+import { EventStatusIcon } from "@/lib/rsvp-status";
+import { cn } from "@/lib/utils";
+
+import { EventDetailPopover } from "./EventDetailPopover";
 import { shouldRenderWeekDragSegment } from "./week-drag-segment";
 
 interface WeekViewProps {
@@ -329,10 +331,11 @@ export function WeekView({
     for (const span of allDaySpans) {
       let placed = false;
       for (const row of rows) {
+        // i18n-ignore scanner false positive for layout property access
         const hasConflict = row.some(
           (existing) =>
-            span.startCol <= existing.endCol &&
-            span.endCol >= existing.startCol,
+            /* i18n-ignore scanner false positive */ span.startCol <=
+              existing.endCol && span.endCol >= existing.startCol,
         );
         if (!hasConflict) {
           row.push(span);
@@ -355,10 +358,11 @@ export function WeekView({
     for (const span of allDaySpans) {
       let placed = false;
       for (let r = 0; r < rows.length; r++) {
+        // i18n-ignore scanner false positive for layout property access
         const hasConflict = rows[r].some(
           (existing) =>
-            span.startCol <= existing.endCol &&
-            span.endCol >= existing.startCol,
+            /* i18n-ignore scanner false positive */ span.startCol <=
+              existing.endCol && span.endCol >= existing.startCol,
         );
         if (!hasConflict) {
           rows[r].push({ ...span, id: span.event.id });
@@ -592,7 +596,17 @@ export function WeekView({
                     onDraftDiscard={onDraftDiscard}
                   >
                     <button
-                      className="absolute flex items-center gap-1 truncate rounded px-1.5 text-left text-[11px] font-medium text-foreground transition-opacity hover:opacity-80"
+                      className={cn(
+                        "absolute flex items-center gap-1 truncate rounded px-1.5 text-left text-[11px] font-medium text-foreground transition-opacity hover:opacity-80",
+                        event.ownerColor && "pr-3.5",
+                      )}
+                      aria-label={
+                        event.ownerName || event.overlayEmail
+                          ? `${event.title}, ${
+                              event.ownerName || event.overlayEmail
+                            }'s calendar`
+                          : event.title
+                      }
                       style={{
                         top: `${rowIdx * allDayRowHeight + 4}px`,
                         left: `${leftPct}%`,
@@ -613,6 +627,13 @@ export function WeekView({
                       )}
                       <EventStatusIcon event={event} className="shrink-0" />
                       <span className="truncate">{event.title}</span>
+                      {event.ownerColor && (
+                        <span
+                          aria-hidden="true"
+                          className="absolute right-1 top-1/2 size-1.5 -translate-y-1/2 rounded-full ring-1 ring-background/70"
+                          style={{ backgroundColor: event.ownerColor }}
+                        />
+                      )}
                     </button>
                   </EventDetailPopover>
                 );
@@ -864,7 +885,15 @@ export function WeekView({
                             "ring-2 ring-primary/40",
                           canDrag && segmentStartsHere && "cursor-grab",
                           isBeingDragged && isDragging && "cursor-grabbing",
+                          event.ownerColor && "pr-4",
                         )}
+                        aria-label={
+                          event.ownerName || event.overlayEmail
+                            ? `${event.title}, ${
+                                event.ownerName || event.overlayEmail
+                              }'s calendar`
+                            : event.title
+                        }
                         style={{
                           ...style,
                           left: `${li.left}px`,
@@ -894,6 +923,13 @@ export function WeekView({
                             isBeingDragged && isDragging ? 0.9 : undefined,
                         }}
                       >
+                        {event.ownerColor && (
+                          <span
+                            aria-hidden="true"
+                            className="absolute right-1.5 top-1.5 size-1.5 rounded-full ring-1 ring-background/70"
+                            style={{ backgroundColor: event.ownerColor }}
+                          />
+                        )}
                         {durationMin <= 30 ? (
                           <div className="flex items-baseline gap-1 truncate">
                             {allOthersOut && (

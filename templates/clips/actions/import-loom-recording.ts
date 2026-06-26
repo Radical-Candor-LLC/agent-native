@@ -1,25 +1,22 @@
 import { defineAction } from "@agent-native/core";
 import { writeAppState } from "@agent-native/core/application-state";
 import { ssrfSafeFetch } from "@agent-native/core/extensions/url-safety";
-import {
-  getActiveFileUploadProvider,
-  uploadFile,
-} from "@agent-native/core/file-upload";
-import {
-  buildDeepLink,
-  resolveBuilderPrivateKey,
-} from "@agent-native/core/server";
+import { uploadFile } from "@agent-native/core/file-upload";
+import { buildDeepLink } from "@agent-native/core/server";
+import { extractLoomVideoId, normalizeLoomShareUrl } from "@shared/loom.js";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import {
   getCurrentOwnerEmail,
   nanoid,
+  ownerEmailMatches,
   parseSpaceIds,
   requireOrganizationAccess,
   stringifySpaceIds,
 } from "../server/lib/recordings.js";
-import { extractLoomVideoId, normalizeLoomShareUrl } from "@shared/loom.js";
+import { hasRequestVideoStorage } from "../server/lib/video-storage.js";
 import {
   fetchLoomTranscript,
   loomTranscriptUnavailableMessage,
@@ -83,22 +80,6 @@ const ImportLoomRecordingSchema = z.object({
 
 const LOOM_STORAGE_SETUP_REQUIRED_REASON =
   "Video storage is not connected yet. Connect Builder.io or configure S3-compatible storage, then retry this Loom import.";
-
-async function hasConfiguredUploadStorage(): Promise<boolean> {
-  const provider = getActiveFileUploadProvider();
-  if (!provider) return false;
-  if (provider.id !== "builder") return true;
-
-  try {
-    return Boolean(await resolveBuilderPrivateKey());
-  } catch (err) {
-    console.warn(
-      "[clips] Builder storage credential check failed:",
-      err instanceof Error ? err.message : String(err),
-    );
-    return false;
-  }
-}
 
 function recordingDeepLink(recordingId: string): string {
   return buildDeepLink({
@@ -168,7 +149,7 @@ export default defineAction({
         .where(
           and(
             eq(schema.recordings.id, args.recordingId),
-            eq(schema.recordings.ownerEmail, ownerEmail),
+            ownerEmailMatches(schema.recordings.ownerEmail, ownerEmail),
           ),
         );
       if (!existingRecording) {
@@ -302,7 +283,7 @@ export default defineAction({
       };
     };
 
-    if (!(await hasConfiguredUploadStorage())) {
+    if (!(await hasRequestVideoStorage())) {
       return await saveWaitingForStorage(
         existingRecording?.videoSizeBytes ?? 0,
       );

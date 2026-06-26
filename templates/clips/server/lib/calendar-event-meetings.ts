@@ -1,20 +1,23 @@
 import { Buffer } from "node:buffer";
-import { and, eq } from "drizzle-orm";
+
 import { readAppSecret, writeAppSecret } from "@agent-native/core/secrets";
 import { resolveAccess } from "@agent-native/core/sharing";
+import { and, eq } from "drizzle-orm";
+
 import { getDb, schema } from "../db/index.js";
+import {
+  detectPlatform,
+  getEvent,
+  pickJoinUrl,
+  resolveGoogleOAuthCredentialCandidates,
+  refreshAccessTokenWithFallback,
+  type CalendarEvent,
+} from "./google-calendar-client.js";
 import {
   getActiveOrganizationId,
   getCurrentOwnerEmail,
   nanoid,
 } from "./recordings.js";
-import {
-  detectPlatform,
-  getEvent,
-  pickJoinUrl,
-  refreshAccessToken,
-  type CalendarEvent,
-} from "./google-calendar-client.js";
 
 export const CALENDAR_MEETING_ID_PREFIX = "gcal";
 
@@ -77,9 +80,8 @@ export function shouldMarkNeedsReauth(message: string): boolean {
 export async function resolveCalendarAccessToken(
   account: CalendarAccountForEvents,
 ): Promise<string | null> {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  if (!clientId || !clientSecret || !account.ownerEmail) return null;
+  const credentialCandidates = resolveGoogleOAuthCredentialCandidates();
+  if (!credentialCandidates.length || !account.ownerEmail) return null;
 
   let bundle: AccessTokenBundle | null = null;
   if (account.accessTokenSecretRef) {
@@ -112,10 +114,9 @@ export async function resolveCalendarAccessToken(
 
   let refreshed;
   try {
-    refreshed = await refreshAccessToken({
+    refreshed = await refreshAccessTokenWithFallback({
       refreshToken: refreshSecret.value,
-      clientId,
-      clientSecret,
+      credentials: credentialCandidates,
     });
   } catch {
     // TODO(needs-reauth classification): a transient refresh failure (network

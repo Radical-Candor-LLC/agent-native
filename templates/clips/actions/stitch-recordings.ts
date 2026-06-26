@@ -12,7 +12,7 @@
  *      recordings in order.
  *   2. It fetches each source video via `/api/video/:id`, concatenates them
  *      using ffmpeg.wasm (see `app/lib/ffmpeg-export.ts` for the wasm init).
- *   3. It uploads the resulting blob via the normal chunked upload flow.
+ *   3. It uploads the resulting blob through the configured file-upload provider.
  *   4. It calls THIS action to create the new recording row, passing
  *      `sourceRecordingIds` for provenance, the uploaded `videoUrl`, and the
  *      new `durationMs`.
@@ -28,12 +28,17 @@
  */
 
 import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { and, eq, inArray } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
-import { getCurrentOwnerEmail, nanoid } from "../server/lib/recordings.js";
 import { writeAppState } from "@agent-native/core/application-state";
+import { and, eq, inArray } from "drizzle-orm";
+import { z } from "zod";
+
 import { parseEdits, serializeEdits } from "../app/lib/timestamp-mapping.js";
+import { getDb, schema } from "../server/db/index.js";
+import {
+  getCurrentOwnerEmail,
+  nanoid,
+  ownerEmailMatches,
+} from "../server/lib/recordings.js";
 import { assertNativeRecordingMedia } from "./lib/native-media.js";
 
 export default defineAction({
@@ -65,6 +70,12 @@ export default defineAction({
   run: async (args) => {
     const db = getDb();
     const ownerEmail = getCurrentOwnerEmail();
+    const videoUrl = args.videoUrl?.trim() || null;
+    if (videoUrl?.startsWith("data:")) {
+      throw new Error(
+        "Stitched videos must be uploaded to Builder.io or S3-compatible storage before creating a recording.",
+      );
+    }
 
     let ids: string[];
     if (typeof args.sourceRecordingIds === "string") {
@@ -88,7 +99,7 @@ export default defineAction({
       .where(
         and(
           inArray(schema.recordings.id, ids),
-          eq(schema.recordings.ownerEmail, ownerEmail),
+          ownerEmailMatches(schema.recordings.ownerEmail, ownerEmail),
         ),
       );
     if (sources.length !== ids.length) {
@@ -127,9 +138,9 @@ export default defineAction({
       orgId: organizationId,
       folderId: args.folderId ?? null,
       title: args.title?.trim() || "Stitched recording",
-      status: args.videoUrl ? "ready" : "processing",
-      uploadProgress: args.videoUrl ? 100 : 0,
-      videoUrl: args.videoUrl ?? null,
+      status: videoUrl ? "ready" : "processing",
+      uploadProgress: videoUrl ? 100 : 0,
+      videoUrl,
       videoFormat: "mp4",
       durationMs: totalDuration,
       width,
@@ -146,7 +157,7 @@ export default defineAction({
     } as any);
 
     await writeAppState("refresh-signal", { ts: Date.now() });
-    if (!args.videoUrl) {
+    if (!videoUrl) {
       // Tell the UI it needs to upload the stitched video.
       await writeAppState(`recording-upload-${id}`, {
         recordingId: id,
@@ -163,9 +174,9 @@ export default defineAction({
     return {
       id,
       sourceRecordingIds: ids,
-      status: args.videoUrl ? ("ready" as const) : ("processing" as const),
+      status: videoUrl ? ("ready" as const) : ("processing" as const),
       durationMs: totalDuration,
-      uploadChunkUrlTemplate: args.videoUrl
+      uploadChunkUrlTemplate: videoUrl
         ? null
         : `/api/uploads/${id}/chunk?index={index}&total={total}&isFinal={isFinal}`,
     };

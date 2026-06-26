@@ -1,13 +1,3 @@
-import React, {
-  useState,
-  useRef,
-  useEffect,
-  useCallback,
-  useMemo,
-  useLayoutEffect,
-  forwardRef,
-  useImperativeHandle,
-} from "react";
 import {
   AssistantRuntimeProvider,
   useLocalRuntime,
@@ -25,73 +15,6 @@ import type {
 } from "@assistant-ui/react";
 import { CompositeAttachmentAdapter } from "@assistant-ui/react";
 import {
-  createAgentChatAdapter,
-  type AgentChatSurfaceKind,
-} from "./agent-chat-adapter.js";
-import {
-  createAgentChatRuntimeAdapter,
-  type AgentChatRuntime,
-} from "./chat/runtime.js";
-import {
-  appendAgentChatContextToMessage,
-  formatAgentChatContextItemsForPrompt,
-  normalizeAgentChatContextItem,
-  publishAgentChatContextItems,
-  refreshAgentChatContext,
-  type AgentChatContextItem,
-} from "./agent-chat.js";
-import {
-  useAgentDynamicSuggestionsResult,
-  type AgentDynamicSuggestionsOption,
-} from "./dynamic-suggestions.js";
-import type { ReasoningEffort } from "../shared/reasoning-effort.js";
-import type {
-  ChatThreadScope,
-  ChatThreadSnapshot,
-} from "./use-chat-threads.js";
-import { useAgentEngineConfigured } from "./use-agent-engine-configured.js";
-import { getActiveRun } from "./active-run-state.js";
-import {
-  AgentAutoContinueSignal,
-  type ContentPart,
-  readSSEStreamRaw,
-  settleInterruptedToolCalls,
-} from "./sse-event-processor.js";
-import { captureError } from "./analytics.js";
-import {
-  AssistantMessageListErrorBoundary,
-  AssistantUiStaleIndexErrorBoundary,
-} from "./assistant-ui-recovery.js";
-import { cn } from "./utils.js";
-import { useNearBottomAutoscroll } from "./conversation/index.js";
-import { TextAttachmentAdapter } from "./composer/attachment-accept.js";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "./components/ui/tooltip.js";
-import { AGENT_CHAT_VIEW_TRANSITION_PREPARE_EVENT } from "./chat-view-transition.js";
-import {
-  GuidedQuestionFlow,
-  useGuidedQuestionFlow,
-} from "./guided-questions.js";
-import { useDevMode } from "./use-dev-mode.js";
-import { agentNativePath } from "./api-path.js";
-import {
-  TiptapComposer,
-  type ComposerSubmitIntent,
-  type TiptapComposerHandle,
-} from "./composer/TiptapComposer.js";
-import { AgentComposerFrame } from "./composer/AgentComposerFrame.js";
-import type {
-  AgentComposerLayoutVariant,
-  Reference,
-} from "./composer/types.js";
-import { isPastedTextAttachmentName } from "./composer/pasted-text.js";
-import { PastedTextChip } from "./composer/PastedTextChip.js";
-import { ContextMeter } from "./context-xray/ContextMeter.js";
-import {
   IconMessage,
   IconX,
   IconPlayerStop,
@@ -100,6 +23,43 @@ import {
   IconAlertTriangle,
   IconRefresh,
 } from "@tabler/icons-react";
+import React, {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  useMemo,
+  useLayoutEffect,
+  forwardRef,
+  useImperativeHandle,
+} from "react";
+
+import type { ReasoningEffort } from "../shared/reasoning-effort.js";
+import {
+  getActiveRun,
+  resolveReconnectAfterSeq,
+  setActiveRun,
+  updateActiveRunSeq,
+} from "./active-run-state.js";
+import {
+  createAgentChatAdapter,
+  type AgentChatSurfaceKind,
+} from "./agent-chat-adapter.js";
+import {
+  appendAgentChatContextToMessage,
+  formatAgentChatContextItemsForPrompt,
+  normalizeAgentChatContextItem,
+  publishAgentChatContextItems,
+  refreshAgentChatContext,
+  type AgentChatContextItem,
+} from "./agent-chat.js";
+import { captureError } from "./analytics.js";
+import { agentNativePath } from "./api-path.js";
+import {
+  AssistantMessageListErrorBoundary,
+  AssistantUiStaleIndexErrorBoundary,
+} from "./assistant-ui-recovery.js";
+import { AGENT_CHAT_VIEW_TRANSITION_PREPARE_EVENT } from "./chat-view-transition.js";
 // ─── chat/ module imports ─────────────────────────────────────────────────────
 import {
   DownscalingImageAttachmentAdapter,
@@ -115,12 +75,6 @@ import {
 } from "./chat/attachment-adapters.js";
 import { TextStreamingContext } from "./chat/markdown-renderer.js";
 import {
-  ChatRunningContext,
-  ApprovalContext,
-  type ApprovalContextValue,
-  ReconnectStreamMessage,
-} from "./chat/tool-call-display.js";
-import {
   CheckpointContext,
   MessageActionsContext,
   UserMessage,
@@ -128,6 +82,13 @@ import {
   SelectionAttachedPill,
   RunningActivityStatus,
 } from "./chat/message-components.js";
+import {
+  repoHasAssistantMessage,
+  getRepoMessages,
+  getRepoMessage,
+  shouldImportServerThreadData,
+  dedupeRepoMessagesById,
+} from "./chat/repo-helpers.js";
 import {
   BuilderSetupCard,
   LoopLimitContinueCard,
@@ -141,11 +102,58 @@ import {
   type RunErrorInfo,
 } from "./chat/run-recovery.js";
 import {
-  repoHasAssistantMessage,
-  getRepoMessages,
-  getRepoMessage,
-  shouldImportServerThreadData,
-} from "./chat/repo-helpers.js";
+  createAgentChatRuntimeAdapter,
+  type AgentChatRuntime,
+} from "./chat/runtime.js";
+import {
+  ChatRunningContext,
+  ApprovalContext,
+  type ApprovalContextValue,
+  ReconnectStreamMessage,
+} from "./chat/tool-call-display.js";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "./components/ui/tooltip.js";
+import { AgentComposerFrame } from "./composer/AgentComposerFrame.js";
+import { TextAttachmentAdapter } from "./composer/attachment-accept.js";
+import { isPastedTextAttachmentName } from "./composer/pasted-text.js";
+import { PastedTextChip } from "./composer/PastedTextChip.js";
+import {
+  TiptapComposer,
+  type ComposerSubmitIntent,
+  type ComposerImageModelMenu,
+  type TiptapComposerHandle,
+} from "./composer/TiptapComposer.js";
+import type {
+  AgentComposerLayoutVariant,
+  Reference,
+} from "./composer/types.js";
+import { ContextMeter } from "./context-xray/ContextMeter.js";
+import { useNearBottomAutoscroll } from "./conversation/index.js";
+import {
+  useAgentDynamicSuggestionsResult,
+  type AgentDynamicSuggestionsOption,
+} from "./dynamic-suggestions.js";
+import {
+  GuidedQuestionFlow,
+  useGuidedQuestionFlow,
+} from "./guided-questions.js";
+import {
+  AgentAutoContinueSignal,
+  type ContentPart,
+  readSSEStreamRaw,
+  settleInterruptedToolCalls,
+} from "./sse-event-processor.js";
+import { useAgentEngineConfigured } from "./use-agent-engine-configured.js";
+import type {
+  ChatThreadScope,
+  ChatThreadSnapshot,
+} from "./use-chat-threads.js";
+import { useDevMode } from "./use-dev-mode.js";
+import { cn } from "./utils.js";
 
 export {
   AssistantMessageListErrorBoundary,
@@ -385,8 +393,8 @@ function ComposerAttachmentPreviewCard({
         className={cn(
           "absolute flex h-6 w-6 items-center justify-center rounded-full border border-border/60 bg-background/95 text-muted-foreground shadow-sm transition hover:text-foreground",
           isImage
-            ? "right-1.5 top-1.5 opacity-100 md:opacity-0 md:group-hover:opacity-100"
-            : "right-1.5 top-1.5",
+            ? "end-1.5 top-1.5 opacity-100 md:opacity-0 md:group-hover:opacity-100"
+            : "end-1.5 top-1.5",
         )}
         aria-label={`Remove ${attachment.name}`}
       >
@@ -630,9 +638,7 @@ export interface AssistantChatProps {
   suggestions?: string[];
   /** Context-aware suggestions merged with `suggestions`. Enabled by default. */
   dynamicSuggestions?: AgentDynamicSuggestionsOption;
-  /** Optional content rendered in the empty state, above the suggestion buttons.
-   *  Used by MultiTabAssistantChat to surface "previous chats for this design"
-   *  when the current thread is empty but the scope has other threads. */
+  /** Optional content rendered in the empty state, above the suggestion buttons. */
   emptyStateAddon?: React.ReactNode;
   /** Whether to show the header bar. Default: true */
   showHeader?: boolean;
@@ -707,6 +713,11 @@ export interface AssistantChatProps {
   onModelChange?: (model: string, engine: string) => void;
   /** Callback when user picks a reasoning effort from the picker */
   onEffortChange?: (effort: ReasoningEffort) => void;
+  /**
+   * Optional secondary model menu (e.g. an image-generation model) shown inside
+   * the composer's model picker. Opt-in; chat-only apps omit it.
+   */
+  imageModelMenu?: ComposerImageModelMenu;
   /** Callback when user clicks "Fork Chat" in the message actions menu */
   onForkChat?: () => void | boolean | Promise<void | boolean>;
   /** Override Builder/provider connect routing for embedded hosts. */
@@ -818,6 +829,11 @@ export function clearChatStorage(tabId?: string) {
  * messages missing these fields crash.
  */
 function ensureMessageMetadata(repo: any): any {
+  // Drop duplicate message ids before import — assistant-ui's MessageRepository
+  // throws "performOp/link: A message with the same id already exists in the
+  // parent tree" (Sentry AGENT-NATIVE-BROWSER-2Q) when fed repeated ids. No-op
+  // for the normal no-duplicate case. See dedupeRepoMessagesById.
+  repo = dedupeRepoMessagesById(repo);
   if (!repo?.messages || !Array.isArray(repo.messages)) return repo;
   for (const entry of repo.messages) {
     // Handle both wrapped ({ message: { ... } }) and flat ({ role, ... }) formats
@@ -972,6 +988,7 @@ const AssistantChatInner = forwardRef<
     availableModels,
     onModelChange,
     onEffortChange,
+    imageModelMenu,
     onForkChat,
     onConnectProvider,
     plusMenuMode = "full",
@@ -1247,6 +1264,7 @@ const AssistantChatInner = forwardRef<
   // When stop is clicked during reconnect, keep content visible (don't wipe it)
   const [reconnectFrozen, setReconnectFrozen] = useState(false);
   const reconnectRunIdRef = useRef<string | null>(null);
+  const [reconnectAfterSeq, setReconnectAfterSeq] = useState(0);
   const reconnectAbortRef = useRef<AbortController | null>(null);
   // Nuclear stop: user clicked stop. Clears the stop button/indicator AND
   // lets new submissions go through immediately — prevents the "stuck
@@ -1456,6 +1474,13 @@ const AssistantChatInner = forwardRef<
       if (reconnectRunIdRef.current === runId) return true;
 
       reconnectRunIdRef.current = runId;
+      const afterSeq = resolveReconnectAfterSeq(threadId, runId);
+      setReconnectAfterSeq(afterSeq);
+      setActiveRun({
+        threadId,
+        runId,
+        lastSeq: afterSeq > 0 ? afterSeq - 1 : -1,
+      });
       setIsReconnecting(true);
       setReconnectFrozen(false);
       setReconnectContent([]);
@@ -1498,9 +1523,16 @@ const AssistantChatInner = forwardRef<
       const streamReconnect = async () => {
         let noProgressDuringReconnect = false;
         let latestContent: ContentPart[] = [];
+        const threadPollInterval =
+          afterSeq > 0
+            ? window.setInterval(() => {
+                if (reconnectRunIdRef.current !== runId) return;
+                void refreshThreadFromServer();
+              }, 2000)
+            : undefined;
         try {
           const sseRes = await fetch(
-            `${apiUrl}/runs/${encodeURIComponent(runId)}/events?after=0`,
+            `${apiUrl}/runs/${encodeURIComponent(runId)}/events?after=${afterSeq}`,
             { signal: abortCtrl.signal },
           );
           if (sseRes.ok && sseRes.body) {
@@ -1511,6 +1543,7 @@ const AssistantChatInner = forwardRef<
             let rafPending = false;
             let latestSnapshot: ContentPart[] = [];
             const scheduleUpdate = (snapshot: ContentPart[]) => {
+              if (afterSeq > 0) return;
               latestSnapshot = snapshot;
               if (rafPending) return;
               rafPending = true;
@@ -1526,8 +1559,11 @@ const AssistantChatInner = forwardRef<
               toolCallCounter,
               tabId,
               scheduleUpdate,
+              (seq) => updateActiveRunSeq(seq),
             );
-            setReconnectContent([...content]);
+            if (afterSeq === 0) {
+              setReconnectContent([...content]);
+            }
           }
         } catch (err) {
           if (
@@ -1543,6 +1579,9 @@ const AssistantChatInner = forwardRef<
             noProgressDuringReconnect = true;
           }
         } finally {
+          if (threadPollInterval !== undefined) {
+            window.clearInterval(threadPollInterval);
+          }
           clearInterval(watchdog);
           clearTimeout(maxReconnectTimer);
         }
@@ -1570,9 +1609,17 @@ const AssistantChatInner = forwardRef<
           } catch {
             // Best effort — the important part is unwinding the UI.
           }
-          settleInterruptedToolCalls(latestContent);
-          setReconnectContent([...latestContent]);
-          setReconnectFrozen(latestContent.length > 0);
+          if (afterSeq > 0) {
+            // Tail-resume only replays new events; never freeze that slice as a
+            // complete assistant turn — the server thread is authoritative.
+            await refreshThreadFromServer();
+            setReconnectContent([]);
+            setReconnectFrozen(false);
+          } else {
+            settleInterruptedToolCalls(latestContent);
+            setReconnectContent([...latestContent]);
+            setReconnectFrozen(latestContent.length > 0);
+          }
           setRunErrorInfo({
             message:
               "The previous agent run stopped producing visible progress while reconnecting, so it was stopped before it could keep looping.",
@@ -1584,6 +1631,7 @@ const AssistantChatInner = forwardRef<
           reconnectAbortRef.current = null;
           setIsReconnecting(false);
           reconnectRunIdRef.current = null;
+          setReconnectAfterSeq(0);
           window.dispatchEvent(
             new CustomEvent("agentNative.chatRunning", {
               detail: { isRunning: false, tabId: tabId || threadId },
@@ -1610,6 +1658,7 @@ const AssistantChatInner = forwardRef<
           reconnectAbortRef.current = null;
           setIsReconnecting(false);
           reconnectRunIdRef.current = null;
+          setReconnectAfterSeq(0);
           window.dispatchEvent(
             new CustomEvent("agentNative.chatRunning", {
               detail: { isRunning: false, tabId: tabId || threadId },
@@ -2018,18 +2067,22 @@ const AssistantChatInner = forwardRef<
     // is about to hit "Refresh chat" — that's the "Reload UI required"
     // symptom we want signal on.
     const stuckCapture = window.setTimeout(() => {
-      captureError(new Error("agent-chat:auth_error_card_stuck"), {
-        tags: {
-          context: "agent-native-chat",
-          errorCode: "auth_error_card",
-          sessionAvailable: String(authSessionAvailable),
-          sessionExpired: String(!!authError.sessionExpired),
-        },
-        extra: {
-          threadId: threadId ?? null,
-          tabId: tabId ?? null,
-        },
-      });
+      void (async () => {
+        const hasSession = await checkAuthSession();
+        if (hasSession) return;
+        captureError(new Error("agent-chat:auth_error_card_stuck"), {
+          tags: {
+            context: "agent-native-chat",
+            errorCode: "auth_error_card",
+            sessionAvailable: String(authSessionAvailable),
+            sessionExpired: String(!!authError.sessionExpired),
+          },
+          extra: {
+            threadId: threadId ?? null,
+            tabId: tabId ?? null,
+          },
+        });
+      })();
     }, 3000);
     const handler = () => void checkAuthSession();
     const timer = window.setTimeout(handler, 250);
@@ -2356,6 +2409,7 @@ const AssistantChatInner = forwardRef<
       reconnectAbortRef.current?.abort();
       reconnectAbortRef.current = null;
       reconnectRunIdRef.current = null;
+      setReconnectAfterSeq(0);
       setIsReconnecting(false);
       setReconnectFrozen(reconnectContent.length > 0);
     }
@@ -2822,7 +2876,15 @@ const AssistantChatInner = forwardRef<
     !isRestoring &&
     !isReconnecting &&
     !authError;
-  const centeredEmptyState = centerComposerWhenEmpty && isFreshEmptyChat;
+  const centeredRestoringState =
+    centerComposerWhenEmpty &&
+    messages.length === 0 &&
+    !hasActiveChatWork &&
+    isRestoring &&
+    !isReconnecting &&
+    !authError;
+  const centeredEmptyState =
+    centerComposerWhenEmpty && (isFreshEmptyChat || centeredRestoringState);
   const showEmptyState =
     messages.length === 0 && !isReconnecting && !hasActiveChatWork;
   const showComposerSlot =
@@ -3015,6 +3077,23 @@ const AssistantChatInner = forwardRef<
                         </button>
                       </div>
                     </div>
+                  ) : isRestoring && centeredRestoringState ? (
+                    <div
+                      className={cn(
+                        "agent-empty-state",
+                        emptyStateDisplay === "hidden"
+                          ? "sr-only"
+                          : "flex h-full flex-col items-center justify-center gap-4 px-4 py-16",
+                      )}
+                      aria-busy="true"
+                    >
+                      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-muted">
+                        <IconMessage className="h-5 w-5 text-muted-foreground" />
+                      </div>
+                      <p className="sr-only">
+                        {emptyStateText ?? "Loading chat..."}
+                      </p>
+                    </div>
                   ) : isRestoring ? (
                     <div className="flex flex-col gap-3 p-4">
                       <div className="flex justify-end">
@@ -3053,7 +3132,7 @@ const AssistantChatInner = forwardRef<
                                   content: [{ type: "text", text: suggestion }],
                                 });
                               }}
-                              className="w-full rounded-lg border border-border px-3 py-2 text-left text-[13px] text-muted-foreground hover:bg-accent hover:text-foreground"
+                              className="w-full rounded-lg border border-border px-3 py-2 text-start text-[13px] text-muted-foreground hover:bg-accent hover:text-foreground"
                             >
                               {suggestion}
                             </button>
@@ -3130,6 +3209,7 @@ const AssistantChatInner = forwardRef<
                         />
                       )}
                       {(isReconnecting || reconnectFrozen) &&
+                        reconnectAfterSeq === 0 &&
                         reconnectContent.length > 0 && (
                           <ReconnectStreamMessage content={reconnectContent} />
                         )}
@@ -3324,6 +3404,7 @@ const AssistantChatInner = forwardRef<
                     availableModels={availableModels}
                     onModelChange={onModelChange}
                     onEffortChange={onEffortChange}
+                    imageModelMenu={imageModelMenu}
                     onConnectProvider={onConnectProvider}
                     toolbarSlot={composerToolbarSlot}
                     contextItems={composerContextItems}

@@ -9,26 +9,34 @@
  */
 
 import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { and, eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
-import { getCurrentOwnerEmail } from "../server/lib/recordings.js";
 import {
   appStateList,
   readAppState,
   writeAppState,
   deleteAppState,
 } from "@agent-native/core/application-state";
-import { uploadFile } from "@agent-native/core/file-upload";
 import { emit } from "@agent-native/core/event-bus";
+import { uploadFile } from "@agent-native/core/file-upload";
 import { captureRouteError } from "@agent-native/core/server";
+import { MAX_UPLOAD_BYTES as MAX_RECORDING_UPLOAD_BYTES } from "@shared/upload-limits.js";
+import { and, eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import { debugLog } from "../server/lib/debug.js";
 import {
   applyFaststart,
   hasPlayableMp4Metadata,
 } from "../server/lib/faststart.js";
-import { debugLog } from "../server/lib/debug.js";
+import {
+  getCurrentOwnerEmail,
+  ownerEmailMatches,
+} from "../server/lib/recordings.js";
+import {
+  requiresConfiguredVideoStorage,
+  STORAGE_SETUP_REQUIRED_REASON,
+} from "../server/lib/video-storage.js";
 import requestTranscript from "./request-transcript.js";
-import { MAX_UPLOAD_BYTES as MAX_RECORDING_UPLOAD_BYTES } from "@shared/upload-limits.js";
 
 /**
  * Decode a base64 string back into a Uint8Array.
@@ -73,8 +81,6 @@ function chunkIndexFromKey(key: string): number {
   return Number(key.split("-").pop() || 0);
 }
 
-const STORAGE_SETUP_REQUIRED_REASON =
-  "Video storage is not connected yet. Connect Builder.io or configure S3-compatible storage to upload and finish saving this clip.";
 const RECORDING_TOO_LARGE_REASON =
   "Recording is too large to process after automatic compression. Please update the app and try again, or record a shorter clip.";
 
@@ -148,7 +154,7 @@ export default defineAction({
         .where(
           and(
             eq(schema.recordings.id, id),
-            eq(schema.recordings.ownerEmail, ownerEmail),
+            ownerEmailMatches(schema.recordings.ownerEmail, ownerEmail),
           ),
         );
 
@@ -343,7 +349,7 @@ export default defineAction({
 
         if (!hasPlayableMp4Metadata(uploadData)) {
           const err = new Error(
-            "Recorded MP4 is missing playback metadata. Please retry the recording.",
+            "Recorded MP4 is corrupted or incomplete and cannot be recovered. Please record again.",
           );
           try {
             captureRouteError(err, {
@@ -410,6 +416,41 @@ export default defineAction({
 
       if (upload === null) {
         const now = new Date().toISOString();
+        if (requiresConfiguredVideoStorage()) {
+          await db
+            .update(schema.recordings)
+            .set({
+              status: "failed",
+              failureReason: STORAGE_SETUP_REQUIRED_REASON,
+              durationMs: finalDurationMs,
+              width: finalWidth,
+              height: finalHeight,
+              hasAudio: finalHasAudio,
+              hasCamera: finalHasCamera,
+              uploadProgress: 0,
+              updatedAt: now,
+            })
+            .where(eq(schema.recordings.id, id));
+
+          await writeAppState(`recording-upload-${id}`, {
+            recordingId: id,
+            status: "failed",
+            failureReason: STORAGE_SETUP_REQUIRED_REASON,
+            storageSetupRequired: true,
+            progress: 0,
+            updatedAt: now,
+          });
+          await writeAppState("refresh-signal", { ts: Date.now() });
+
+          return {
+            id,
+            status: "failed" as const,
+            storageSetupRequired: true,
+            failureReason: STORAGE_SETUP_REQUIRED_REASON,
+            durationMs: finalDurationMs,
+          };
+        }
+
         await db
           .update(schema.recordings)
           .set({

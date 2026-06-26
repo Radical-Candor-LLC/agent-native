@@ -2,7 +2,7 @@
 
 This is a headless Agent Native app. It starts with actions instead of a browser UI, so the first useful primitive is callable from the agent, CLI, and action runtime.
 
-This app is not stateless. The Agent Native runtime uses SQL-backed stores for app state, settings, auth/session data, resources, and other framework capabilities when those surfaces are used. Local development can use SQLite at `data/app.db`; hosted or long-lived deployments should set `DATABASE_URL` to a persistent database.
+This app is not stateless. The Agent Native runtime uses SQL-backed stores for app state, settings, auth/session data, resources, and other framework capabilities when those surfaces are used. Local development can use SQLite at `data/app.db`, or PGlite with `DATABASE_URL=pglite:./data/pglite` after installing `@electric-sql/pglite`. Hosted or long-lived deployments should set `DATABASE_URL` to a persistent database.
 
 ## Working In This App
 
@@ -17,7 +17,8 @@ This app is not stateless. The Agent Native runtime uses SQL-backed stores for a
 ## Framework Docs Lookup
 
 Version-matched Agent Native docs ship with `@agent-native/core` in
-`node_modules/@agent-native/core/docs`.
+`node_modules/@agent-native/core/docs`. A source-only corpus of core and
+first-party template patterns ships in `node_modules/@agent-native/core/corpus`.
 
 - Use `pnpm action docs-search --query "<topic>"` to search framework docs,
   bundled `AGENTS.md`, and codebase skills.
@@ -26,12 +27,21 @@ Version-matched Agent Native docs ship with `@agent-native/core` in
   `a2a-protocol`, `external-agents`, `mcp-protocol`, `database`, `sharing`,
   and `security` for advanced headless workflows.
 - Use `pnpm action docs-search --list` to see everything available.
+- Use `pnpm action source-search --query "<pattern>"` when you need current
+  implementation examples or template best practices, and
+  `pnpm action source-search --path <path>` to read a specific corpus file.
 - If the action runner is unavailable, read
   `node_modules/@agent-native/core/docs/AGENTS.md` and search
-  `node_modules/@agent-native/core/docs/content/` directly with `rg`.
+  `node_modules/@agent-native/core/docs/content/` directly with `rg`. Search
+  `node_modules/@agent-native/core/corpus/` for source examples.
 
 Read these local package docs before implementing advanced Agent Native
-features. Prefer this app's own `AGENTS.md` for app-specific rules.
+features. Prefer this app's own `AGENTS.md` for app-specific rules, then use
+the corpus for reusable framework/template patterns.
+After updating `@agent-native/core`, run `pnpm skills:update` or
+`npx @agent-native/core@latest skills update scaffold --project` from the app
+root to refresh framework-provided `.agents/skills` and repair `CLAUDE.md` /
+`.claude/skills` compatibility links.
 
 ## Actions
 
@@ -45,7 +55,7 @@ features. Prefer this app's own `AGENTS.md` for app-specific rules.
 Run actions from this app root:
 
 ```bash
-pnpm action hello --name Builder
+pnpm action hello '{"name":"Builder"}'
 ```
 
 Run the app-agent loop against those actions:

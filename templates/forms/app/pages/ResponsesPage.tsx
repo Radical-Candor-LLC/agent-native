@@ -1,6 +1,5 @@
-import { useMemo, useState } from "react";
-import { useParams, Link } from "react-router";
-import { format } from "date-fns";
+import { useFormatters, useT } from "@agent-native/core/client";
+import type { FormField } from "@shared/types";
 import {
   IconArrowLeft,
   IconDownload,
@@ -10,15 +9,18 @@ import {
   IconArrowDown,
   IconArrowsSort,
 } from "@tabler/icons-react";
-import { Button } from "@/components/ui/button";
+import { format } from "date-fns";
+import { useMemo, useState } from "react";
+import { useParams, Link } from "react-router";
+
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { cn } from "@/lib/utils";
-import { normalizeFields } from "@/lib/normalize-fields";
 import { useForm } from "@/hooks/use-forms";
 import { useFormResponses } from "@/hooks/use-responses";
-import type { FormField } from "@shared/types";
+import { normalizeFields } from "@/lib/normalize-fields";
+import { cn } from "@/lib/utils";
 
 type SortKey = "_submitted" | string; // string = field id
 type SortDir = "asc" | "desc";
@@ -27,6 +29,39 @@ function valueAsString(val: unknown): string {
   if (val === undefined || val === null) return "";
   if (Array.isArray(val)) return val.join(", ");
   return String(val);
+}
+
+/** Drop the protocol for a cleaner table cell; the full URL stays the link href. */
+function formatPageUrl(url: string): string {
+  return url.replace(/^https?:\/\//, "");
+}
+
+/**
+ * Only http(s) URLs are safe to use as an anchor href. Page URLs arrive from
+ * client `_meta` and could be spoofed by a direct POST, so reject other schemes
+ * (e.g. `javascript:`) to avoid a self-XSS when the owner clicks the cell.
+ */
+function safeHttpUrl(value: string): string | null {
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Friendly label for the client-surface token forwarded by feedback embeds. */
+function formatClientSurface(surface: string): string {
+  switch (surface) {
+    case "electron":
+      return "Desktop (Electron)";
+    case "tauri":
+      return "Desktop (Tauri)";
+    case "web":
+      return "Web";
+    default:
+      return surface;
+  }
 }
 
 function compareValues(a: unknown, b: unknown): number {
@@ -48,6 +83,8 @@ function compareValues(a: unknown, b: unknown): number {
 }
 
 export function ResponsesPage() {
+  const t = useT();
+  const { formatDate, formatNumber } = useFormatters();
   const { id } = useParams<{ id: string }>();
   const { data: form } = useForm(id!);
   const { data, isLoading, error, refetch } = useFormResponses(id!);
@@ -62,6 +99,25 @@ export function ResponsesPage() {
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("_submitted");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const hasSubmitterEmail = useMemo(
+    () => responses.some((r: any) => valueAsString(r.submitterEmail).trim()),
+    [responses],
+  );
+  const hasPageUrl = useMemo(
+    () => responses.some((r: any) => valueAsString(r.pageUrl).trim()),
+    [responses],
+  );
+  const hasClientSurface = useMemo(
+    () => responses.some((r: any) => valueAsString(r.clientSurface).trim()),
+    [responses],
+  );
+  const responseTableMinWidth =
+    64 +
+    160 +
+    (hasSubmitterEmail ? 224 : 0) +
+    (hasPageUrl ? 256 : 0) +
+    (hasClientSurface ? 160 : 0) +
+    Math.max(fields.length, 1) * 320;
 
   function toggleSort(key: SortKey) {
     if (sortKey === key) {
@@ -77,6 +133,19 @@ export function ResponsesPage() {
     let rows = responses;
     if (q) {
       rows = rows.filter((r: any) => {
+        if (valueAsString(r.submitterEmail).toLowerCase().includes(q)) {
+          return true;
+        }
+        if (valueAsString(r.pageUrl).toLowerCase().includes(q)) {
+          return true;
+        }
+        if (
+          formatClientSurface(valueAsString(r.clientSurface))
+            .toLowerCase()
+            .includes(q)
+        ) {
+          return true;
+        }
         for (const f of fields) {
           if (valueAsString(r.data[f.id]).toLowerCase().includes(q))
             return true;
@@ -89,6 +158,12 @@ export function ResponsesPage() {
       if (sortKey === "_submitted") {
         cmp =
           new Date(a.submittedAt).getTime() - new Date(b.submittedAt).getTime();
+      } else if (sortKey === "_email") {
+        cmp = compareValues(a.submitterEmail, b.submitterEmail);
+      } else if (sortKey === "_page") {
+        cmp = compareValues(a.pageUrl, b.pageUrl);
+      } else if (sortKey === "_source") {
+        cmp = compareValues(a.clientSurface, b.clientSurface);
       } else {
         cmp = compareValues(a.data[sortKey], b.data[sortKey]);
       }
@@ -99,9 +174,24 @@ export function ResponsesPage() {
 
   function exportCsv() {
     if (!fields.length || !filteredSorted.length) return;
-    const headers = ["Submitted At", ...fields.map((f) => f.label)];
+    const headers = [
+      "Submitted At",
+      ...(hasSubmitterEmail ? ["Submitter Email"] : []),
+      ...(hasPageUrl ? ["Page URL"] : []),
+      ...(hasClientSurface ? ["Source"] : []),
+      ...fields.map((f) => f.label),
+    ];
     const rows = filteredSorted.map((r) => [
       r.submittedAt,
+      ...(hasSubmitterEmail ? [valueAsString(r.submitterEmail)] : []),
+      ...(hasPageUrl ? [valueAsString(r.pageUrl)] : []),
+      ...(hasClientSurface
+        ? [
+            valueAsString(r.clientSurface)
+              ? formatClientSurface(valueAsString(r.clientSurface))
+              : "",
+          ]
+        : []),
       ...fields.map((f) => valueAsString(r.data[f.id])),
     ]);
 
@@ -158,7 +248,7 @@ export function ResponsesPage() {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-3">
         <p className="text-sm text-muted-foreground">
-          Failed to load responses
+          {t("responses.failedLoad")}
         </p>
         <Button
           variant="outline"
@@ -167,7 +257,7 @@ export function ResponsesPage() {
           className="gap-2"
         >
           <IconRefresh className="h-3.5 w-3.5" />
-          Retry
+          {t("common.retry")}
         </Button>
       </div>
     );
@@ -186,8 +276,10 @@ export function ResponsesPage() {
           >
             <Link to={`/forms/${id}`}>
               <IconArrowLeft className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Back to Builder</span>
-              <span className="sm:hidden">Back</span>
+              <span className="hidden sm:inline">
+                {t("responses.backToBuilder")}
+              </span>
+              <span className="sm:hidden">{t("common.back")}</span>
             </Link>
           </Button>
           <span className="text-sm font-medium truncate hidden sm:block">
@@ -195,8 +287,14 @@ export function ResponsesPage() {
           </span>
           <Badge variant="secondary" className="text-xs shrink-0">
             {search.trim() && filteredSorted.length !== total
-              ? `${filteredSorted.length} of ${total}`
-              : `${total} response${total !== 1 ? "s" : ""}`}
+              ? t("responses.filteredCount", {
+                  count: formatNumber(filteredSorted.length),
+                  total: formatNumber(total),
+                })
+              : t("responses.totalCount", {
+                  count: total,
+                  formattedCount: formatNumber(total),
+                })}
           </Badge>
         </div>
         <div className="flex items-center gap-2 shrink-0">
@@ -206,7 +304,7 @@ export function ResponsesPage() {
               <Input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Filter responses..."
+                placeholder={t("responses.filterPlaceholder")}
                 className="h-8 pl-7 w-48 text-xs"
               />
             </div>
@@ -219,8 +317,8 @@ export function ResponsesPage() {
             disabled={filteredSorted.length === 0}
           >
             <IconDownload className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Export CSV</span>
-            <span className="sm:hidden">Export</span>
+            <span className="hidden sm:inline">{t("responses.exportCsv")}</span>
+            <span className="sm:hidden">{t("responses.export")}</span>
           </Button>
         </div>
       </div>
@@ -233,7 +331,7 @@ export function ResponsesPage() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Filter responses..."
+              placeholder={t("responses.filterPlaceholder")}
               className="h-8 pl-7 text-xs"
             />
           </div>
@@ -243,22 +341,35 @@ export function ResponsesPage() {
       {/* Table */}
       {responses.length === 0 ? (
         <div className="flex flex-col items-center justify-center flex-1 py-20">
-          <h3 className="font-medium mb-1">No responses yet</h3>
+          <h3 className="font-medium mb-1">{t("responses.emptyTitle")}</h3>
           <p className="text-sm text-muted-foreground">
-            Share your form to start collecting responses
+            {t("responses.emptyDescription")}
           </p>
         </div>
       ) : filteredSorted.length === 0 ? (
         <div className="flex flex-col items-center justify-center flex-1 py-20">
-          <h3 className="font-medium mb-1">No matches</h3>
+          <h3 className="font-medium mb-1">{t("responses.noMatchesTitle")}</h3>
           <p className="text-sm text-muted-foreground">
-            No responses contain "{search}"
+            {t("responses.noMatchesDescription", { search })}
           </p>
         </div>
       ) : (
         <div className="flex-1 min-w-0 overflow-auto overscroll-x-contain">
-          <div className="w-max min-w-full">
-            <table className="min-w-full text-sm whitespace-nowrap">
+          <div className="min-w-full">
+            <table
+              className="min-w-full table-fixed text-sm"
+              style={{ minWidth: responseTableMinWidth }}
+            >
+              <colgroup>
+                <col className="w-16" />
+                <col className="w-40" />
+                {hasSubmitterEmail ? <col className="w-56" /> : null}
+                {hasPageUrl ? <col className="w-64" /> : null}
+                {hasClientSurface ? <col className="w-40" /> : null}
+                {fields.map((f) => (
+                  <col key={f.id} className="w-80" />
+                ))}
+              </colgroup>
               <thead>
                 <tr className="border-b border-border bg-muted/30">
                   <th
@@ -268,11 +379,35 @@ export function ResponsesPage() {
                     #
                   </th>
                   <SortableHeader
-                    label="Submitted"
+                    label={t("responses.submitted")}
                     active={sortKey === "_submitted"}
                     dir={sortDir}
                     onClick={() => toggleSort("_submitted")}
                   />
+                  {hasSubmitterEmail ? (
+                    <SortableHeader
+                      label={t("responses.email")}
+                      active={sortKey === "_email"}
+                      dir={sortDir}
+                      onClick={() => toggleSort("_email")}
+                    />
+                  ) : null}
+                  {hasPageUrl ? (
+                    <SortableHeader
+                      label={t("responses.page")}
+                      active={sortKey === "_page"}
+                      dir={sortDir}
+                      onClick={() => toggleSort("_page")}
+                    />
+                  ) : null}
+                  {hasClientSurface ? (
+                    <SortableHeader
+                      label={t("responses.source")}
+                      active={sortKey === "_source"}
+                      dir={sortDir}
+                      onClick={() => toggleSort("_source")}
+                    />
+                  ) : null}
                   {fields.map((f) => (
                     <SortableHeader
                       key={f.id}
@@ -294,8 +429,67 @@ export function ResponsesPage() {
                       {filteredSorted.length - idx}
                     </td>
                     <td className="min-w-36 px-4 py-2.5 text-xs text-muted-foreground whitespace-nowrap">
-                      {format(new Date(response.submittedAt), "MMM d, h:mm a")}
+                      {formatDate(response.submittedAt, {
+                        month: "short",
+                        day: "numeric",
+                        hour: "numeric",
+                        minute: "2-digit",
+                      })}
                     </td>
+                    {hasSubmitterEmail ? (
+                      <td className="w-56 px-4 py-3 align-top text-xs text-muted-foreground whitespace-normal break-words">
+                        {valueAsString(response.submitterEmail) || "-"}
+                      </td>
+                    ) : null}
+                    {hasPageUrl ? (
+                      <td className="w-64 px-4 py-3 align-top text-xs whitespace-normal break-words">
+                        {(() => {
+                          const raw = valueAsString(response.pageUrl);
+                          if (!raw)
+                            return (
+                              <span className="text-muted-foreground">-</span>
+                            );
+                          const safe = safeHttpUrl(raw);
+                          return safe ? (
+                            <a
+                              href={safe}
+                              target="_blank"
+                              rel="noopener noreferrer nofollow"
+                              title={raw}
+                              className="text-primary hover:underline"
+                            >
+                              {formatPageUrl(raw)}
+                            </a>
+                          ) : (
+                            <span title={raw} className="text-muted-foreground">
+                              {formatPageUrl(raw)}
+                            </span>
+                          );
+                        })()}
+                      </td>
+                    ) : null}
+                    {hasClientSurface ? (
+                      <td className="w-40 px-4 py-3 align-top text-xs whitespace-nowrap">
+                        {(() => {
+                          const surface = valueAsString(response.clientSurface);
+                          if (!surface)
+                            return (
+                              <span className="text-muted-foreground">-</span>
+                            );
+                          const label = formatClientSurface(surface);
+                          // Make desktop submissions pop; web stays muted text.
+                          return surface === "web" ? (
+                            <span className="text-muted-foreground">
+                              {label}
+                            </span>
+                          ) : (
+                            <Badge variant="secondary" className="font-normal">
+                              {label}
+                            </Badge>
+                          );
+                        })()}
+                      </td>
+                    ) : null}
                     {fields.map((f) => {
                       const val = response.data[f.id];
                       const display =
@@ -305,7 +499,7 @@ export function ResponsesPage() {
                       return (
                         <td
                           key={f.id}
-                          className="min-w-40 max-w-[220px] truncate px-4 py-2.5 text-xs"
+                          className="min-w-48 px-4 py-3 align-top text-xs leading-5 whitespace-pre-wrap break-words"
                           title={display}
                         >
                           {display}
@@ -329,6 +523,7 @@ function SortableHeader(props: {
   dir: SortDir;
   onClick: () => void;
 }) {
+  const t = useT();
   const { label, active, dir, onClick } = props;
   const Icon = !active
     ? IconArrowsSort
@@ -347,7 +542,7 @@ function SortableHeader(props: {
           "inline-flex items-center gap-1 cursor-pointer hover:text-foreground",
           active && "text-foreground",
         )}
-        aria-label={`Sort by ${label}`}
+        aria-label={t("responses.sortBy", { label })}
       >
         {label}
         <Icon className="h-3 w-3 opacity-60" />

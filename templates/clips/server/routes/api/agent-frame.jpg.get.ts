@@ -11,10 +11,12 @@ import {
   setResponseStatus,
   type H3Event,
 } from "h3";
+
 import {
   loadPublicAgentAccess,
   loadRecordingMediaBytes,
   queryString,
+  RecordingMediaFetchError,
   type PublicAgentAccess,
 } from "../../lib/public-agent-context.js";
 import {
@@ -144,11 +146,13 @@ export default defineEventHandler(async (event: H3Event) => {
     const isFrameError = err instanceof VideoFrameExtractionError;
     setResponseStatus(
       event,
-      isFrameError && err.code === "FFMPEG_UNAVAILABLE"
-        ? 503
-        : err instanceof Error && /too large/i.test(err.message)
-          ? 413
-          : 422,
+      err instanceof RecordingMediaFetchError
+        ? err.statusCode
+        : isFrameError && err.code === "FFMPEG_UNAVAILABLE"
+          ? 503
+          : err instanceof Error && /too large/i.test(err.message)
+            ? 413
+            : 422,
     );
     setResponseHeader(event, "Content-Type", "application/json; charset=utf-8");
     setResponseHeader(event, "X-Content-Type-Options", "nosniff");

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import listDocs from "./list-docs";
 import readDoc from "./read-doc";
 import searchDocs from "./search-docs";
@@ -25,5 +26,13 @@ describe("docs actions", () => {
 
     expect(output).toContain("Onboarding");
     expect(output).toContain("**Path:** /docs/onboarding");
+  });
+
+  it("finds Clips browser logging guidance", async () => {
+    const output = await searchDocs.run({ query: "browser logs" });
+
+    expect(output).toContain("Clips");
+    expect(output).toContain("Browser logs and developer diagnostics");
+    expect(output).toContain("**Path:** /docs/template-clips");
   });
 });

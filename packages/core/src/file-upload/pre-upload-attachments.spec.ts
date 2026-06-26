@@ -1,10 +1,11 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+
+import type { AgentChatAttachment } from "../agent/types.js";
 import {
   preUploadAttachments,
   preUploadImageAttachments,
   isFileUploadProviderConfigured,
 } from "./pre-upload-attachments.js";
-import type { AgentChatAttachment } from "../agent/types.js";
 
 const uploadFileMock = vi.hoisted(() => vi.fn());
 const getActiveProviderMock = vi.hoisted(() => vi.fn());
@@ -258,6 +259,8 @@ describe("preUploadAttachments", () => {
 
     expect(result.providerMissing).toBe(true);
     expect(result.injectedText).toContain("no file-upload provider");
+    expect(result.injectedText).toContain("connect-builder");
+    expect(result.injectedText).not.toContain("Settings");
   });
 
   it("does not crash when uploadFile throws; keeps base64 for that attachment", async () => {

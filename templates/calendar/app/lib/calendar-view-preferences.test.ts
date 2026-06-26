@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import type { CalendarEvent } from "@shared/api";
 import {
   DEFAULT_CALENDAR_VIEW_PREFERENCES,
   normalizeCalendarViewPreferences,
 } from "@shared/calendar-view-preferences";
+import { describe, expect, it } from "vitest";
+
 import { getEventDisplayColor } from "./event-colors";
-import type { CalendarEvent } from "@shared/api";
 
 const googleEvent: CalendarEvent = {
   id: "google-1",
@@ -56,5 +57,15 @@ describe("calendar view preferences", () => {
         preferences,
       ),
     ).toBe("#4ECDC4");
+  });
+
+  it("keeps overlay owner color separate from event color", () => {
+    expect(
+      getEventDisplayColor({
+        ...googleEvent,
+        overlayEmail: "teammate@example.com",
+        ownerColor: "#4ECDC4",
+      }),
+    ).toBe("#5B9BD5");
   });
 });

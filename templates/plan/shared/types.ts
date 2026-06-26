@@ -1,9 +1,9 @@
-import type { PlanContent } from "./plan-content.js";
 import {
   PLAN_COMMENT_RESOLUTION_TARGETS,
   type PlanCommentMention,
   type PlanCommentResolutionTarget,
 } from "./comment-context.js";
+import type { PlanContent } from "./plan-content.js";
 
 export {
   PLAN_COMMENT_RESOLUTION_TARGETS,
@@ -103,6 +103,7 @@ export interface PlanSummary {
   approvedAt?: string | null;
   deletedAt?: string | null;
   deletedBy?: string | null;
+  ownerEmail?: string | null;
   canDelete?: boolean;
   sectionCounts: Record<string, number>;
   commentCount: number;

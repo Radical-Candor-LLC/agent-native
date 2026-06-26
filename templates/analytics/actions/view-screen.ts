@@ -1,13 +1,17 @@
 import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import {
+  readAppState,
+  readAppStateForCurrentTab,
+} from "@agent-native/core/application-state";
 import {
   getRequestUserEmail,
   getRequestOrgId,
 } from "@agent-native/core/server";
-import { readAppState } from "@agent-native/core/application-state";
+import { z } from "zod";
+
+import { listDashboardCatalog } from "../server/lib/dashboard-catalog";
 import { getAnalysis, getDashboard } from "../server/lib/dashboards-store";
 import { listAnalyticsPublicKeys } from "../server/lib/first-party-analytics.js";
-import { listDashboardCatalog } from "../server/lib/dashboard-catalog";
 
 export default defineAction({
   description:
@@ -16,7 +20,7 @@ export default defineAction({
   http: false,
   readOnly: true,
   run: async () => {
-    const navigation = await readAppState("navigation");
+    const navigation = await readAppStateForCurrentTab("navigation");
     const url = (await readAppState("__url__")) as {
       pathname?: string;
       search?: string;
