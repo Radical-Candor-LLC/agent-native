@@ -1,24 +1,78 @@
+import Ajv, { type ValidateFunction } from "ajv";
 import {
   defineEventHandler,
   setResponseHeader,
   setResponseStatus,
   getMethod,
 } from "h3";
-import Ajv, { type ValidateFunction } from "ajv";
+import type { EventHandler as H3EventHandler } from "h3";
+
+import { isAgentActionStopError } from "../action.js";
+import { readAppState } from "../application-state/script-helpers.js";
+import { isReadOnlyShellCommand } from "../coding-tools/index.js";
+import { isDemoModeEnabled } from "../demo/config.js";
+import { redactDemoData, redactDemoString } from "../demo/redact.js";
+import { extensionIdFromPathname } from "../extensions/path.js";
+import { preUploadAttachments } from "../file-upload/pre-upload-attachments.js";
+import { isMcpActionResult } from "../mcp-client/app-result.js";
+import { isMcpToolAllowedForRequest } from "../mcp-client/visibility.js";
+import {
+  completeRun as completeProgressRun,
+  startRun as startProgressRun,
+  updateRunProgress,
+} from "../progress/registry.js";
+import {
+  getFrontmatterValue,
+  parseFrontmatter,
+} from "../resources/metadata.js";
 import {
   isDeployCredentialFallbackAllowed,
   readDeployCredentialEnv,
 } from "../server/credential-provider.js";
-import type { EventHandler as H3EventHandler } from "h3";
-import type {
-  ActionTool,
-  AgentNativeJsonSchema,
-  AgentChatAttachment,
-  AgentChatRequest,
-  AgentChatEvent,
-  AgentChatReference,
-  AgentChatStructuredMessage,
-} from "./types.js";
+import { readBody } from "../server/h3-helpers.js";
+import {
+  getRequestRunContext,
+  ensureRequestRunContext,
+  getRequestOrgId,
+  getRequestUserEmail,
+} from "../server/request-context.js";
+import { fireInternalDispatch } from "../server/self-dispatch.js";
+import {
+  isReasoningEffort,
+  normalizeReasoningEffortForModel,
+  type ReasoningEffort,
+} from "../shared/reasoning-effort.js";
+import { applyContextDirectives } from "./context-xray/apply-directives.js";
+import { loadContextDirectives } from "./context-xray/directives-store.js";
+import {
+  buildManifest,
+  writeContextManifest,
+} from "./context-xray/manifest.js";
+import { computeProtectedSegmentIds } from "./context-xray/segments.js";
+import {
+  AGENT_CHAT_BACKGROUND_RUN_FIELD,
+  isAgentChatDurableBackgroundEnabled,
+  isInBackgroundFunctionRuntime,
+  resolveAgentChatProcessRunDispatchPath,
+} from "./durable-background.js";
+import {
+  LLM_MISSING_CREDENTIALS_ERROR_CODE,
+  LLM_MISSING_CREDENTIALS_MESSAGE,
+  userFacingLlmCredentialError,
+} from "./engine/credential-errors.js";
+import {
+  resolveEngine,
+  registerBuiltinEngines,
+  getStoredModelForEngine,
+  normalizeModelForEngine,
+} from "./engine/index.js";
+import { resolveMaxOutputTokensForEngine } from "./engine/output-tokens.js";
+import { PROVIDER_TO_ENV } from "./engine/provider-env-vars.js";
+import {
+  backfillEngineMessagesToolResults,
+  stringifyToolUseInputForGateway,
+  unmatchedToolResultReplayText,
+} from "./engine/translate-anthropic.js";
 import type {
   AgentEngine,
   EngineTool,
@@ -28,32 +82,23 @@ import type {
   EngineToolResultPart,
 } from "./engine/types.js";
 import { EngineError } from "./engine/types.js";
-import { resolveMaxOutputTokensForEngine } from "./engine/output-tokens.js";
 import {
-  backfillEngineMessagesToolResults,
-  stringifyToolUseInputForGateway,
-  unmatchedToolResultReplayText,
-} from "./engine/translate-anthropic.js";
+  getDefaultMaxIterations,
+  normalizeMaxIterations,
+  readAgentLoopSettings,
+} from "./loop-settings.js";
 import {
-  resolveEngine,
-  registerBuiltinEngines,
-  getStoredModelForEngine,
-  normalizeModelForEngine,
-} from "./engine/index.js";
+  maybeCompactThread,
+  buildObservationalContext,
+  hasObservationalMemory,
+  serializeObservationalMemoryBlock,
+} from "./observational-memory/index.js";
 import {
-  LLM_MISSING_CREDENTIALS_ERROR_CODE,
-  LLM_MISSING_CREDENTIALS_MESSAGE,
-  userFacingLlmCredentialError,
-} from "./engine/credential-errors.js";
-import { PROVIDER_TO_ENV } from "./engine/provider-env-vars.js";
-import { readAppState } from "../application-state/script-helpers.js";
-import { isDemoModeEnabled } from "../demo/config.js";
-import { redactDemoData, redactDemoString } from "../demo/redact.js";
-import {
-  redactSensitiveFields,
-  sanitizeToolErrorText,
-  sanitizeToolErrorValue,
-} from "./tool-error-redaction.js";
+  ProcessorChain,
+  TripWire,
+  toolCallsFromContent,
+  type Processor,
+} from "./processors.js";
 import {
   startRun,
   subscribeToRun,
@@ -64,73 +109,232 @@ import {
   tryClaimRunSlot,
 } from "./run-manager.js";
 import type { ActiveRun } from "./run-manager.js";
-import { readBody } from "../server/h3-helpers.js";
-import { isReadOnlyShellCommand } from "../coding-tools/index.js";
-import {
-  getRequestRunContext,
-  ensureRequestRunContext,
-  getRequestOrgId,
-  getRequestUserEmail,
-} from "../server/request-context.js";
-import { isMcpToolAllowedForRequest } from "../mcp-client/visibility.js";
-import { isMcpActionResult } from "../mcp-client/app-result.js";
-import {
-  createToolSearchEntry,
-  TOOL_SEARCH_ACTION_NAME,
-} from "./tool-search.js";
-import {
-  getDefaultMaxIterations,
-  normalizeMaxIterations,
-  readAgentLoopSettings,
-} from "./loop-settings.js";
-import {
-  isReasoningEffort,
-  normalizeReasoningEffortForModel,
-  type ReasoningEffort,
-} from "../shared/reasoning-effort.js";
-import { isAgentActionStopError } from "../action.js";
 import {
   writeLedgerEntry,
   readLedgerEntry,
   clearLedgerForThread,
   getCurrentTurnEventsForThread,
+  insertRun,
+  updateRunHeartbeat,
+  updateRunStatusIfRunning,
+  claimBackgroundRun,
+  readBackgroundRunClaim,
+  recordRunDiagnostic,
+  RUN_DIAG_STAGE,
+  UNCLAIMED_BACKGROUND_RUN_GRACE_MS,
 } from "./run-store.js";
 import {
   classifyToolCallJournal,
   findCompletedJournalEntry,
   type ToolCallJournal,
 } from "./tool-call-journal.js";
-import { preUploadAttachments } from "../file-upload/pre-upload-attachments.js";
-import { extensionIdFromPathname } from "../extensions/path.js";
-import { applyContextDirectives } from "./context-xray/apply-directives.js";
 import {
-  ProcessorChain,
-  TripWire,
-  toolCallsFromContent,
-  type Processor,
-} from "./processors.js";
+  redactSensitiveFields,
+  sanitizeToolErrorText,
+  sanitizeToolErrorValue,
+} from "./tool-error-redaction.js";
 import {
-  completeRun as completeProgressRun,
-  startRun as startProgressRun,
-  updateRunProgress,
-} from "../progress/registry.js";
-import { loadContextDirectives } from "./context-xray/directives-store.js";
-import {
-  buildManifest,
-  writeContextManifest,
-} from "./context-xray/manifest.js";
-import { computeProtectedSegmentIds } from "./context-xray/segments.js";
-import {
-  maybeCompactThread,
-  buildObservationalContext,
-  hasObservationalMemory,
-  serializeObservationalMemoryBlock,
-} from "./observational-memory/index.js";
+  createToolSearchEntry,
+  TOOL_SEARCH_ACTION_NAME,
+} from "./tool-search.js";
+import type {
+  ActionTool,
+  AgentNativeJsonSchema,
+  AgentChatAttachment,
+  AgentChatRequest,
+  AgentChatEvent,
+  AgentChatReference,
+  AgentChatStructuredMessage,
+} from "./types.js";
 
 // Register built-in engines on first import
 registerBuiltinEngines();
 
 export { PROVIDER_TO_ENV };
+
+/**
+ * Grace window + poll interval for the foreground circuit-breaker that confirms
+ * a background worker actually CLAIMED a 202-dispatched run before recovering
+ * inline. The grace must cover the worker's cold-start + per-request init before
+ * it reaches `claimBackgroundRun`: light apps win the claim in ~1-2s, but heavy
+ * apps (e.g. analytics) were observed in prod taking >8s, so an 8s grace made
+ * their worker lose the race every time and always fall back to inline (adding
+ * ~8s latency with no background budget). 15s covers the slow apps while staying
+ * well within the foreground's ~40s soft-timeout.
+ */
+export const BACKGROUND_CLAIM_GRACE_MS = 15_000;
+/**
+ * Safety margin subtracted from the unclaimed-reaper grace when deciding how
+ * long the foreground may keep waiting for a slow-but-live worker to claim. The
+ * foreground recovers the run inline this many ms BEFORE `reapUnclaimedBackgroundRun`
+ * would error an unclaimed row, so the foreground always wins the race to claim
+ * and the two never collide — see `resolveBackgroundDispatchOutcome`.
+ */
+export const BACKGROUND_REAPER_SAFETY_MARGIN_MS = 2_000;
+export const BACKGROUND_CLAIM_POLL_MS = 400;
+
+export type BackgroundDispatchOutcome =
+  | { action: "stream" }
+  | { action: "subscribe" }
+  | {
+      action: "inline";
+      reason: "dispatch-failed" | "worker-never-claimed" | "no-row";
+    };
+
+/**
+ * `diag_stage` is persisted as a JSON payload (`{ stage, detail?, at }`) by
+ * `recordRunDiagnostic`. Extract the bare stage name so it can be compared to
+ * `RUN_DIAG_STAGE` constants. Falls back to the raw value when it is not JSON
+ * (defensive — legacy rows or tests may store a bare stage).
+ */
+function parseRunDiagStage(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { stage?: unknown };
+    if (parsed && typeof parsed.stage === "string") return parsed.stage;
+  } catch {
+    // Not JSON — treat the raw value as the stage name.
+  }
+  return typeof raw === "string" ? raw : null;
+}
+
+/**
+ * Decide what the foreground should do after attempting a durable background
+ * dispatch. A Netlify async background function returns 202 the instant it
+ * ENQUEUES the invocation — that is NOT proof the worker executed. If the
+ * generated wrapper fails to import/hand off to the route, the worker never
+ * reaches `claimBackgroundRun` and the run is reaped as "worker never claimed".
+ *
+ * So after a successful dispatch we poll briefly for the worker to CLAIM the run:
+ *   - claimed within grace        → "stream"    (subscribe to the worker)
+ *   - dispatch failed OR no claim  → recover inline by atomically claiming the
+ *       run ourselves: if we win → "inline"; if a (delayed) worker already won
+ *       it → "subscribe" (never double-run).
+ *
+ * Pure except for the injected `readClaim`/`claim`/`now`/`sleep` deps, so each
+ * branch is unit-testable.
+ */
+export async function resolveBackgroundDispatchOutcome(opts: {
+  dispatched: boolean;
+  backgroundRowInserted: boolean;
+  runId: string;
+  graceMs: number;
+  /**
+   * The unclaimed-run reaper's grace (`UNCLAIMED_BACKGROUND_RUN_GRACE_MS`). When
+   * provided, the foreground may keep waiting PAST `graceMs` while the worker is
+   * provably alive and still in setup — but it recovers inline before the run has
+   * been unclaimed this long (minus the safety margin), so it always claims
+   * before the reaper can fire. Omit to disable the extension (behaves exactly
+   * like the base grace).
+   */
+  reaperGraceMs?: number;
+  /** Margin subtracted from `reaperGraceMs` (default `BACKGROUND_REAPER_SAFETY_MARGIN_MS`). */
+  reaperSafetyMarginMs?: number;
+  pollIntervalMs: number;
+  readClaim: (runId: string) => Promise<{
+    dispatchMode: string | null;
+    status: string | null;
+    diagStage?: string | null;
+    /** COALESCE(heartbeat_at, started_at) — the reaper's liveness basis. */
+    lastLivenessAt?: number | null;
+  } | null>;
+  claim: (runId: string) => Promise<boolean>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<BackgroundDispatchOutcome> {
+  const now = opts.now ?? (() => Date.now());
+  const sleep =
+    opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+
+  // Pre-claim diag stages that prove the worker is ALIVE and executing: it
+  // reached the route, passed HMAC auth, and is grinding through handler setup
+  // (system prompt build / action loading) on its way to `claimBackgroundRun`.
+  // A dead handoff — the generated wrapper never reached the route — never
+  // records these, so it is NOT eligible for the extended grace.
+  const ALIVE_IN_SETUP: ReadonlySet<string> = new Set([
+    RUN_DIAG_STAGE.authPassed,
+    RUN_DIAG_STAGE.workerEntered,
+  ]);
+  // Pre-claim diag stages that prove the worker DIED before claiming — stop
+  // waiting and recover inline immediately instead of burning the rest of the
+  // grace on a worker that already failed.
+  const DIED_BEFORE_CLAIM: ReadonlySet<string> = new Set([
+    RUN_DIAG_STAGE.authFailed,
+    RUN_DIAG_STAGE.routeThrew,
+    RUN_DIAG_STAGE.workerThrew,
+  ]);
+
+  if (opts.dispatched) {
+    // One now() at entry + one per iteration (so callers/tests that model a
+    // stepping clock stay deterministic).
+    const startedAt = now();
+    const baseDeadline = startedAt + opts.graceMs;
+    const reaperGraceMs = opts.reaperGraceMs;
+    const reaperMargin =
+      opts.reaperSafetyMarginMs ?? BACKGROUND_REAPER_SAFETY_MARGIN_MS;
+    for (;;) {
+      const claim = await opts.readClaim(opts.runId).catch(() => null);
+      if (
+        claim &&
+        ((claim.dispatchMode && claim.dispatchMode !== "background") ||
+          (claim.status && claim.status !== "running"))
+      ) {
+        return { action: "stream" };
+      }
+      // `diag_stage` is stored as JSON ({stage, detail?, at}); compare on the
+      // bare stage name, not the raw payload.
+      const stage = parseRunDiagStage(claim?.diagStage);
+      // Worker recorded a pre-claim death — no point waiting out the grace.
+      if (stage && DIED_BEFORE_CLAIM.has(stage)) break;
+      const elapsedNow = now();
+      // The unclaimed-reaper errors any still-`background` row once it has been
+      // unclaimed for `reaperGraceMs`, measured from the row's OWN liveness
+      // (COALESCE(heartbeat_at, started_at)) — NOT from when we began polling.
+      // Recover inline just before that point so the foreground claims the run
+      // first; anchoring to the row's liveness makes this immune to dispatch
+      // latency between insertRun and the start of polling.
+      const reaperWillFireSoon =
+        reaperGraceMs != null &&
+        claim?.lastLivenessAt != null &&
+        elapsedNow - claim.lastLivenessAt >= reaperGraceMs - reaperMargin;
+      if (reaperWillFireSoon) break;
+      // ADAPTIVE GRACE: past the base window, keep polling ONLY while the worker
+      // is provably alive and still in setup (heavy cold start). A dead handoff
+      // never recorded an ALIVE_IN_SETUP stage, so it recovers inline at the base
+      // grace; the reaper-anchored break above bounds how long a live worker can
+      // extend. The extension is enabled only when a reaper grace was provided.
+      const aliveInSetup =
+        reaperGraceMs != null &&
+        claim?.status === "running" &&
+        !!stage &&
+        ALIVE_IN_SETUP.has(stage);
+      if (elapsedNow >= baseDeadline && !aliveInSetup) break;
+      await sleep(opts.pollIntervalMs);
+    }
+  }
+
+  // Dispatch fast-failed OR no worker claimed within grace → recover inline.
+  if (!opts.backgroundRowInserted) {
+    // No row to reconcile (insert failed / non-duplicate) — run a fresh inline
+    // turn; `startRun` inserts the row.
+    return { action: "inline", reason: "no-row" };
+  }
+  let claimedInline = false;
+  try {
+    claimedInline = await opts.claim(opts.runId);
+  } catch {
+    claimedInline = false;
+  }
+  if (claimedInline) {
+    return {
+      action: "inline",
+      reason: opts.dispatched ? "worker-never-claimed" : "dispatch-failed",
+    };
+  }
+  // The atomic claim was lost: a (delayed) background worker already owns the
+  // run — subscribe to it, never run a second copy.
+  return { action: "subscribe" };
+}
 
 const SAFE_BROWSER_TAB_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
 
@@ -1283,7 +1487,13 @@ function escapeReferenceAttribute(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 }
 
-async function resolveSkillReferenceContent(
+function isRuntimeVisibleSkillContent(content: string): boolean {
+  const frontmatter = parseFrontmatter(content);
+  const scope = getFrontmatterValue(frontmatter, "scope")?.trim().toLowerCase();
+  return scope !== "dev";
+}
+
+export async function resolveSkillReferenceContent(
   ref: AgentChatReference,
 ): Promise<string | null> {
   if (!ref.path && !ref.name) return null;
@@ -1305,17 +1515,21 @@ async function resolveSkillReferenceContent(
       const full = await resourceGet(effective.effectiveResource.id, {
         ...resourceOptions,
       });
-      return full?.content ?? null;
+      if (!full?.content || !isRuntimeVisibleSkillContent(full.content)) {
+        return null;
+      }
+      return full.content;
     } catch {
       return null;
     }
   }
 
   try {
-    const { loadAgentsBundle } = await import("../server/agents-bundle.js");
+    const { loadAgentsBundle, getRuntimeSkills } =
+      await import("../server/agents-bundle.js");
     const bundle = await loadAgentsBundle();
-    const normalizedPath = ref.path.replace(/\/+$/g, "");
-    const skill = Object.values(bundle.skills).find((candidate) => {
+    const normalizedPath = ref.path?.replace(/\/+$/g, "");
+    const skill = getRuntimeSkills(bundle).find((candidate) => {
       const skillPath = candidate.dir.replace(/\/+$/g, "");
       return (
         candidate.meta.name === ref.name ||
@@ -2559,6 +2773,8 @@ export async function runAgentLoop(opts: {
               event.name ??
               (event.id ? toolInputNames.get(event.id) : undefined);
             sendToolInputActivity(toolName);
+          } else if (event.type === "gateway-heartbeat") {
+            send({ type: "stream_keepalive" });
           } else if (event.type === "tool-call") {
             // The authoritative tool-call blocks arrive in assistant-content.
           } else if (event.type === "tool-call-error") {
@@ -2932,6 +3148,28 @@ export async function runAgentLoop(opts: {
             approvalKey,
             ...(toolCall.id ? { toolCallId: toolCall.id } : {}),
           });
+          // Audit the blocked attempt: the action did NOT run, but "the agent
+          // tried to do X and was gated" is itself worth recording. Best-effort,
+          // but AWAITED (not fire-and-forget) so the row isn't lost to a
+          // serverless freeze / request teardown when the turn pauses.
+          try {
+            const { recordActionAudit } = await import("../audit/record.js");
+            await recordActionAudit({
+              config: undefined,
+              args: toolCall.input,
+              ctx: {
+                actionName: toolCall.name,
+                caller: "tool",
+                userEmail: getRequestUserEmail(),
+                orgId: getRequestOrgId() ?? null,
+                ...(opts.threadId ? { threadId: opts.threadId } : {}),
+                ...(opts.turnId ? { turnId: opts.turnId } : {}),
+              },
+              status: "denied",
+            });
+          } catch {
+            // Best-effort — auditing must never break the approval pause.
+          }
           const result =
             `Awaiting human approval to run "${toolCall.name}". This action did ` +
             `NOT execute — a human must approve this specific call before it ` +
@@ -3201,6 +3439,11 @@ export async function runAgentLoop(opts: {
             caller: "tool",
             attachments: opts.attachments,
             signal,
+            // Audit attribution: the action name + the agent thread/turn that
+            // triggered this call, so a mutation can be traced to its run.
+            actionName: toolCall.name,
+            ...(opts.threadId ? { threadId: opts.threadId } : {}),
+            ...(opts.turnId ? { turnId: opts.turnId } : {}),
           }),
         );
 
@@ -3543,6 +3786,35 @@ function endsAtInternalContinuationBoundary(run: ActiveRun): boolean {
   return last.type === "error" && isRecoverableContinuationError(last);
 }
 
+/**
+ * Hard cap on server-driven background→background continuation chunks for a
+ * single logical turn. A `backgroundFunction` run gets a ~13-min soft timeout,
+ * so reaching this boundary at all is the rare exception (most turns finish in
+ * one chunk). The cap bounds a pathological turn that would otherwise chain
+ * background invocations forever, mirroring `MAX_AGENT_TEAM_CONTINUATIONS`.
+ */
+export const MAX_BACKGROUND_RUN_CONTINUATIONS = 20;
+
+/**
+ * Whether the background worker should self-fire the next server-driven
+ * continuation chunk. True only when this is a background worker run that ended
+ * at a recoverable soft-timeout boundary (not aborted/stopped) and the chain is
+ * still under its budget. Extracted so the decision is unit testable without
+ * booting the whole handler.
+ */
+export function shouldChainBackgroundContinuation(opts: {
+  isBackgroundWorker: boolean;
+  run: ActiveRun;
+  continuationCount: number;
+}): boolean {
+  return (
+    opts.isBackgroundWorker &&
+    opts.run.status !== "aborted" &&
+    endsAtInternalContinuationBoundary(opts.run) &&
+    opts.continuationCount < MAX_BACKGROUND_RUN_CONTINUATIONS
+  );
+}
+
 function progressStepFromAgentChatEvent(event: AgentChatEvent): string | null {
   switch (event.type) {
     case "activity":
@@ -3600,17 +3872,35 @@ export function createProductionAgentHandler(
   };
 
   return defineEventHandler(async (event) => {
+    // Diagnostic-only setup-timing instrumentation. Captures wall-clock offsets
+    // from handler entry through the work done BEFORE startRun so a slow pre-run
+    // setup phase is visible in the run diagnostics. Never alters control flow.
+    const setupT0 = Date.now();
+    const setupMarks: Record<string, number> = {};
+    const setupMark = (k: string) => {
+      setupMarks[k] = Date.now() - setupT0;
+    };
     if (getMethod(event) !== "POST") {
       setResponseStatus(event, 405);
       return { error: "Method not allowed" };
     }
 
     let body: AgentChatRequest;
-    try {
-      body = await readBody(event);
-    } catch {
-      setResponseStatus(event, 400);
-      return { error: "Invalid request body" };
+    // The durable-background `_process-run` route already consumed and verified
+    // the request body (h3 v2's web Request body stream is single-use, so a
+    // second readBody would fail). It stashes the verified+augmented body here
+    // so this re-entered handler reads it instead of the spent stream.
+    const preInjectedBody = (event as any)?.context
+      ?.__agentChatBackgroundBody as AgentChatRequest | undefined;
+    if (preInjectedBody && typeof preInjectedBody === "object") {
+      body = preInjectedBody;
+    } else {
+      try {
+        body = await readBody(event);
+      } catch {
+        setResponseStatus(event, 400);
+        return { error: "Invalid request body" };
+      }
     }
 
     const {
@@ -3630,6 +3920,107 @@ export function createProductionAgentHandler(
       scope,
       trackInRunsTray,
     } = body;
+    setupMark("bodyParsed");
+
+    // Durable-background marker. Present ONLY when this handler was re-entered
+    // as the Netlify background worker via the `_process-run` self-dispatch
+    // (the route HMAC-verifies the dispatch before invoking us). When set, we
+    // run the loop inline with the background soft-timeout, reusing the
+    // pre-claimed runId/turnId — we must NOT re-claim the slot or re-dispatch.
+    const backgroundRunMarker =
+      body[AGENT_CHAT_BACKGROUND_RUN_FIELD] &&
+      typeof body[AGENT_CHAT_BACKGROUND_RUN_FIELD] === "object" &&
+      typeof body[AGENT_CHAT_BACKGROUND_RUN_FIELD]!.runId === "string"
+        ? body[AGENT_CHAT_BACKGROUND_RUN_FIELD]!
+        : null;
+    const isBackgroundWorker = backgroundRunMarker !== null;
+    // DIAGNOSTIC-ONLY: progressive per-stage hang localizer for the bg worker.
+    // The worker's runId is available EARLY on the marker (the general `runId`
+    // var resolves much later), so capture it now and emit the LAST setup stage
+    // reached as the run's `diag_stage`. Best-effort, gated on the worker, never
+    // blocks or alters control flow.
+    const bgRunId = isBackgroundWorker
+      ? (backgroundRunMarker?.runId as string)
+      : null;
+    const workerStep = (s: string) => {
+      if (bgRunId)
+        void recordRunDiagnostic(
+          bgRunId,
+          RUN_DIAG_STAGE.workerSetupStep,
+          `${s}=${Date.now() - setupT0}ms`,
+        ).catch(() => {});
+    };
+    // DIAGNOSTIC-ONLY: non-DB breadcrumb to the function log drain. `workerStep`
+    // writes to the DB, which is exactly what stalls after `model_done` in the bg
+    // worker (no diag write lands), so this logs to stdout (Netlify function
+    // logs) instead — used to name the exact post-model_done / pre-claim async
+    // branch that hangs. Gated on the worker so foreground logs stay clean.
+    const bgLog = (label: string) => {
+      if (!isBackgroundWorker) return;
+      try {
+        console.log(
+          `[bg-presend] +${Date.now() - setupT0}ms run=${(bgRunId ?? "").slice(-6)} ${label}`,
+        );
+      } catch {}
+    };
+    // DIAGNOSTIC + DEFENSIVE: race an optional context read against a short
+    // timeout and fall back to a safe default, logging start/done/error/timeout.
+    // A single stuck optional read can no longer block the worker from reaching
+    // claim, and the TIMEOUT breadcrumb names the culprit in the function logs.
+    const withBgFallback = <T>(
+      label: string,
+      ms: number,
+      fallback: T,
+      fn: () => Promise<T>,
+    ): Promise<T> => {
+      bgLog(`${label}:start`);
+      return new Promise<T>((resolve) => {
+        let done = false;
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true;
+          bgLog(`${label}:TIMEOUT@${ms}ms`);
+          resolve(fallback);
+        }, ms);
+        fn().then(
+          (v) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            bgLog(`${label}:done`);
+            resolve(v);
+          },
+          (e) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            bgLog(
+              `${label}:error ${(e as { message?: string })?.message ?? e}`,
+            );
+            resolve(fallback);
+          },
+        );
+      });
+    };
+    // Whether this worker is REALLY executing inside a 15-min Netlify
+    // `-background` function (proven by the runtime function name), not merely a
+    // `_process-run` re-entry that may have landed on the ~60s synchronous
+    // function. Only a true value unlocks the ~13-min soft-timeout budget; a
+    // worker on the 60s function keeps the 40s clamp and checkpoints cleanly.
+    const runsInBackgroundFunction =
+      isBackgroundWorker && isInBackgroundFunctionRuntime();
+    // How many server-driven background continuations have already chained into
+    // this logical turn (0 on the first chunk). Used to bound the chain.
+    const backgroundContinuationCount =
+      isBackgroundWorker &&
+      typeof backgroundRunMarker?.continuationCount === "number" &&
+      Number.isFinite(backgroundRunMarker.continuationCount)
+        ? Math.max(0, Math.floor(backgroundRunMarker.continuationCount))
+        : 0;
+    // The foreground POST decides whether to dispatch into a background
+    // function. The background worker itself never re-dispatches.
+    const dispatchToBackground =
+      !isBackgroundWorker && isAgentChatDurableBackgroundEnabled();
     const requestBrowserTabId = normalizeBrowserTabId(browserTabId);
     const requestChatScope = normalizeChatScope(scope);
     const requestRunCtx = ensureRequestRunContext();
@@ -3679,7 +4070,13 @@ export function createProductionAgentHandler(
         requestAttachments = preparedRequest.attachments;
       }
     }
+    // DIAGNOSTIC-ONLY: owner/request context prep (resolveAgentOwnerEmail +
+    // prepareRequest) finished. A worker stuck before this points at the
+    // owner/request-context awaits.
+    workerStep("db_request_ctx");
 
+    // DIAGNOSTIC-ONLY: bracket attachment upload + text-attachment persistence.
+    workerStep("attach_start");
     // Pre-upload chat attachments (images AND files/PDFs) through the framework
     // file-upload provider (Builder.io by default). The model still sees the
     // base64 multimodal content for the current turn; each uploaded attachment
@@ -3742,9 +4139,13 @@ export function createProductionAgentHandler(
         );
       }
     }
+    // DIAGNOSTIC-ONLY: attachment upload + persistence finished.
+    workerStep("attach_done");
 
     // When a per-request engine override is specified, resolve the API key
     // for that provider instead of the global active engine's provider.
+    // DIAGNOSTIC-ONLY: bracket per-owner API-key resolution (settings/app_secrets reads).
+    workerStep("apikey_start");
     let userApiKey: string | undefined;
     if (requestEngine) {
       const provider = engineToProvider(requestEngine);
@@ -3760,6 +4161,8 @@ export function createProductionAgentHandler(
     } else {
       userApiKey = await getOwnerActiveApiKey(ownerEmail);
     }
+    // DIAGNOSTIC-ONLY: API-key resolution finished.
+    workerStep("apikey_done");
 
     // `options.apiKey` is the value the template constructed the plugin with
     // (e.g. wired from a deployment env var). On a shared hosted deploy this
@@ -3774,6 +4177,9 @@ export function createProductionAgentHandler(
         readDeployCredentialEnv("ANTHROPIC_API_KEY"));
 
     // Resolve engine — per-request engine override takes priority
+    // DIAGNOSTIC-ONLY: bracket engine resolution (Builder credential / app-default
+    // settings reads inside resolveEngine).
+    workerStep("engine_start");
     let engine: AgentEngine;
     try {
       engine = await resolveEngine({
@@ -3788,17 +4194,25 @@ export function createProductionAgentHandler(
         appId: options.appId,
       });
     }
+    // DIAGNOSTIC-ONLY: engine resolution finished.
+    workerStep("engine_done");
 
     // Honor the model the user picked in the settings UI (written via
     // `manage-agent-engine` action="set"), but only when the caller hasn't overridden it for
     // this request or at plugin construction time. Read per-request so a
     // dropdown change in the UI takes effect without a server restart. Skip
     // the DB read entirely when a higher-precedence value is set.
+    // DIAGNOSTIC-ONLY: bracket stored-model resolution (getStoredModelForEngine
+    // settings read).
+    workerStep("model_start");
     const modelCandidate =
       requestModel ??
       configuredModel ??
       (await getStoredModelForEngine(engine, { appId: options.appId })) ??
       engine.defaultModel;
+    // DIAGNOSTIC-ONLY: stored-model resolution finished.
+    workerStep("model_done");
+    bgLog("model_done");
     const model = normalizeModelForEngine(engine, modelCandidate);
     const reasoningEffort = normalizeReasoningEffortForModel(
       model,
@@ -3807,7 +4221,9 @@ export function createProductionAgentHandler(
         : options.reasoningEffort,
     );
 
+    bgLog("onEngineResolved:before");
     options.onEngineResolved?.(engine, model);
+    bgLog("onEngineResolved:after");
 
     // One-line per-turn resolution log so it's obvious in dev which engine
     // is actually handling the request. `requestEngine` is what the client
@@ -3840,236 +4256,323 @@ export function createProductionAgentHandler(
       });
     }
 
+    setupMark("prepDone");
+    // DIAGNOSTIC-ONLY: engine/model/api-key resolution finished. A worker that
+    // reached db_request_ctx but not env_config hung in attachment upload or
+    // engine/model resolution.
+    workerStep("env_config");
+    bgLog("env_config");
+    bgLog("presend:creating");
     // Run all independent pre-send steps in parallel. Each of these hits
     // the DB or invokes an action; running them sequentially was the
-    // single biggest contributor to pre-LLM latency.
-    const enrichedMessagePromise = enrichMessage(requestMessage, references);
+    // single biggest contributor to pre-LLM latency. Each branch is bracketed
+    // with a log-drain breadcrumb (bgLog) so the function logs name any branch
+    // that starts but never finishes; the OPTIONAL context reads additionally
+    // race a short timeout + "" fallback (withBgFallback) so one stuck read
+    // cannot block the worker from reaching claim.
+    bgLog("enrich:start");
+    const enrichedMessagePromise = Promise.resolve(
+      enrichMessage(requestMessage, references),
+    ).then((v) => {
+      bgLog("enrich:done");
+      return v;
+    });
+    bgLog("loop:start");
     const loopSettingsPromise = readAgentLoopSettings({
       userEmail: ownerEmail ?? getRequestUserEmail() ?? null,
       orgId: getRequestOrgId() ?? null,
-    }).catch(() => readAgentLoopSettings({}));
+    })
+      .catch(() => readAgentLoopSettings({}))
+      .then((v) => {
+        bgLog("loop:done");
+        return v;
+      });
 
     let systemPromptError: any = null;
     const systemPromptPromise = (async (): Promise<string> => {
+      const sysPromptStart = Date.now();
+      bgLog("sysprompt:start");
       try {
-        return typeof options.systemPrompt === "function"
-          ? await options.systemPrompt(event)
-          : options.systemPrompt;
+        const sp =
+          typeof options.systemPrompt === "function"
+            ? await options.systemPrompt(event)
+            : options.systemPrompt;
+        bgLog("sysprompt:done");
+        return sp;
       } catch (error) {
         systemPromptError = error;
+        bgLog(
+          "sysprompt:error " +
+            ((error as { message?: string })?.message ?? error),
+        );
         return "";
+      } finally {
+        setupMarks.sysPromptMs = Date.now() - sysPromptStart;
       }
     })();
 
-    const screenContextPromise = (async (): Promise<string> => {
-      try {
-        const viewScreenAction = resolvedActions["view-screen"];
-        if (viewScreenAction) {
-          const result = await viewScreenAction.run(
-            {},
-            {
-              userEmail: getRequestUserEmail(),
-              orgId: getRequestOrgId() ?? null,
-              caller: "tool",
-            },
-          );
-          if (result && result !== "(no output)") {
-            const screenText =
-              typeof result === "string"
-                ? result
-                : JSON.stringify(result, null, 2);
-            return `\n\n<current-screen>\n${capScreenContext(screenText)}\n</current-screen>`;
-          }
-        } else {
-          const navigation = await readAppStateForBrowserTab(
-            "navigation",
-            requestBrowserTabId,
-          );
-          if (navigation) {
-            return `\n\n<current-screen>\n${capScreenContext(JSON.stringify(navigation, null, 2))}\n</current-screen>`;
-          }
-        }
-      } catch {
-        // DB not ready or no navigation state — skip silently
-      }
-      return "";
-    })();
-
-    const urlContextPromise = (async (): Promise<string> => {
-      try {
-        const url = (await readAppStateForBrowserTab(
-          "__url__",
-          requestBrowserTabId,
-        )) as {
-          pathname?: string;
-          search?: string;
-          hash?: string;
-          searchParams?: Record<string, string>;
-        } | null;
-        if (url && (url.pathname || url.search || url.hash)) {
-          const lines: string[] = [];
-          if (url.pathname) lines.push(`pathname: ${url.pathname}`);
-          const extensionId = url.pathname
-            ? extensionIdFromPathname(url.pathname)
-            : null;
-          if (extensionId) lines.push(`extensionId: ${extensionId}`);
-          if (url.search) lines.push(`search: ${url.search}`);
-          if (url.hash) lines.push(`hash: ${url.hash}`);
-          if (url.searchParams && Object.keys(url.searchParams).length > 0) {
-            lines.push("searchParams:");
-            for (const [k, v] of Object.entries(url.searchParams)) {
-              lines.push(`  ${k}: ${v}`);
+    const screenContextPromise = withBgFallback(
+      "screen",
+      6000,
+      "",
+      async (): Promise<string> => {
+        const screenStart = Date.now();
+        try {
+          const viewScreenAction = resolvedActions["view-screen"];
+          if (viewScreenAction) {
+            const result = await viewScreenAction.run(
+              {},
+              {
+                userEmail: getRequestUserEmail(),
+                orgId: getRequestOrgId() ?? null,
+                caller: "tool",
+              },
+            );
+            if (result && result !== "(no output)") {
+              const screenText =
+                typeof result === "string"
+                  ? result
+                  : JSON.stringify(result, null, 2);
+              return `\n\n<current-screen>\n${capScreenContext(screenText)}\n</current-screen>`;
+            }
+          } else {
+            const navigation = await readAppStateForBrowserTab(
+              "navigation",
+              requestBrowserTabId,
+            );
+            if (navigation) {
+              return `\n\n<current-screen>\n${capScreenContext(JSON.stringify(navigation, null, 2))}\n</current-screen>`;
             }
           }
-          return `\n\n<current-url>\n${lines.join("\n")}\n</current-url>`;
+        } catch {
+          // DB not ready or no navigation state — skip silently
+        } finally {
+          setupMarks.screenMs = Date.now() - screenStart;
         }
-      } catch {
-        // DB not ready — skip silently
-      }
-      return "";
-    })();
+        return "";
+      },
+    );
+
+    const urlContextPromise = withBgFallback(
+      "url",
+      6000,
+      "",
+      async (): Promise<string> => {
+        try {
+          const url = (await readAppStateForBrowserTab(
+            "__url__",
+            requestBrowserTabId,
+          )) as {
+            pathname?: string;
+            search?: string;
+            hash?: string;
+            searchParams?: Record<string, string>;
+          } | null;
+          if (url && (url.pathname || url.search || url.hash)) {
+            const lines: string[] = [];
+            if (url.pathname) lines.push(`pathname: ${url.pathname}`);
+            const extensionId = url.pathname
+              ? extensionIdFromPathname(url.pathname)
+              : null;
+            if (extensionId) lines.push(`extensionId: ${extensionId}`);
+            if (url.search) lines.push(`search: ${url.search}`);
+            if (url.hash) lines.push(`hash: ${url.hash}`);
+            if (url.searchParams && Object.keys(url.searchParams).length > 0) {
+              lines.push("searchParams:");
+              for (const [k, v] of Object.entries(url.searchParams)) {
+                lines.push(`  ${k}: ${v}`);
+              }
+            }
+            return `\n\n<current-url>\n${lines.join("\n")}\n</current-url>`;
+          }
+        } catch {
+          // DB not ready — skip silently
+        }
+        return "";
+      },
+    );
 
     // Selection context: written by the client when the user presses Cmd+I
     // with text selected on the page. Treat anything older than 5 minutes
     // as stale and ignore it.
     const SELECTION_TTL_MS = 5 * 60 * 1000;
-    const selectionContextPromise = (async (): Promise<string> => {
-      try {
-        const sel = (await readAppState("pending-selection-context")) as {
-          text?: string;
-          capturedAt?: number;
-        } | null;
-        if (!sel?.text) return "";
-        const capturedAt =
-          typeof sel.capturedAt === "number" ? sel.capturedAt : 0;
-        if (Date.now() - capturedAt > SELECTION_TTL_MS) return "";
-        return (
-          `\n\nThe user has selected the following text and pressed Cmd+I to focus the agent. ` +
-          `Treat this as the immediate context to act on:\n` +
-          `<selection>\n${capSelectionContext(sel.text)}\n</selection>`
-        );
-      } catch {
-        // DB not ready — skip silently
-      }
-      return "";
-    })();
+    const selectionContextPromise = withBgFallback(
+      "selection",
+      6000,
+      "",
+      async (): Promise<string> => {
+        try {
+          const sel = (await readAppState("pending-selection-context")) as {
+            text?: string;
+            capturedAt?: number;
+          } | null;
+          if (!sel?.text) return "";
+          const capturedAt =
+            typeof sel.capturedAt === "number" ? sel.capturedAt : 0;
+          if (Date.now() - capturedAt > SELECTION_TTL_MS) return "";
+          return (
+            `\n\nThe user has selected the following text and pressed Cmd+I to focus the agent. ` +
+            `Treat this as the immediate context to act on:\n` +
+            `<selection>\n${capSelectionContext(sel.text)}\n</selection>`
+          );
+        } catch {
+          // DB not ready — skip silently
+        }
+        return "";
+      },
+    );
 
     // On the first message of a conversation, inject workspace inventory
     // so the agent knows what files, skills, jobs, and custom agents exist.
     // Templates can opt out via `skipFilesContext: true` when the inventory
     // is unrelated to the app's job (e.g. a voice-first macro tracker).
-    const filesContextPromise = (async (): Promise<string> => {
-      let filesContext = "";
-      if (options.skipFilesContext) return filesContext;
-      if (history.length === 0) {
-        try {
-          const {
-            resourceListAccessible,
-            SHARED_OWNER,
-            WORKSPACE_OWNER,
-            resourceGet,
-          } = await import("../resources/store.js");
-          const {
-            getResourceKind,
-            parseCustomAgentProfile,
-            parseRemoteAgentManifest,
-            parseSkillMetadata,
-          } = await import("../resources/metadata.js");
-          const ownerEmail = getRequestUserEmail();
-          const orgId = getRequestOrgId();
-          if (!ownerEmail) throw new Error("no authenticated user");
-          const allResources = await resourceListAccessible(
-            ownerEmail,
-            undefined,
-            { userEmail: ownerEmail, orgId },
-          );
+    const filesContextPromise = withBgFallback(
+      "files",
+      8000,
+      "",
+      async (): Promise<string> => {
+        let filesContext = "";
+        if (options.skipFilesContext) return filesContext;
+        if (history.length === 0) {
+          try {
+            const {
+              resourceListAccessible,
+              SHARED_OWNER,
+              WORKSPACE_OWNER,
+              resourceGet,
+            } = await import("../resources/store.js");
+            const {
+              getResourceKind,
+              parseCustomAgentProfile,
+              parseRemoteAgentManifest,
+              parseSkillMetadata,
+            } = await import("../resources/metadata.js");
+            const ownerEmail = getRequestUserEmail();
+            const orgId = getRequestOrgId();
+            if (!ownerEmail) throw new Error("no authenticated user");
+            const allResources = await resourceListAccessible(
+              ownerEmail,
+              undefined,
+              { userEmail: ownerEmail, orgId },
+            );
 
-          if (allResources.length > 0) {
-            const fileLines: string[] = [];
-            const skillLines: string[] = [];
-            const agentLines: string[] = [];
-            const jobLines: string[] = [];
-            for (const r of allResources) {
-              const scope =
-                r.owner === WORKSPACE_OWNER
-                  ? "workspace"
-                  : r.owner === SHARED_OWNER
-                    ? "shared"
-                    : "personal";
-              const kind = getResourceKind(r.path);
-              if (kind === "file") {
-                fileLines.push(`  ${r.path} (${scope})`);
-                continue;
-              }
+            if (allResources.length > 0) {
+              const fileLines: string[] = [];
+              const skillLines: string[] = [];
+              const agentLines: string[] = [];
+              const jobLines: string[] = [];
+              for (const r of allResources) {
+                const scope =
+                  r.owner === WORKSPACE_OWNER
+                    ? "workspace"
+                    : r.owner === SHARED_OWNER
+                      ? "shared"
+                      : "personal";
+                const kind = getResourceKind(r.path);
+                if (kind === "file") {
+                  fileLines.push(`  ${r.path} (${scope})`);
+                  continue;
+                }
 
-              if (kind === "job") {
-                jobLines.push(`  ${r.path} (${scope})`);
-                continue;
-              }
+                if (kind === "job") {
+                  jobLines.push(`  ${r.path} (${scope})`);
+                  continue;
+                }
 
-              if (
-                kind === "skill" ||
-                kind === "agent" ||
-                kind === "remote-agent"
-              ) {
-                const full = await resourceGet(r.id, {
-                  userEmail: ownerEmail,
-                  orgId,
-                });
-                if (!full) continue;
-                if (kind === "skill") {
-                  const skill = parseSkillMetadata(full.content, r.path);
-                  skillLines.push(
-                    `  ${skill?.name || r.path} — ${compactInventoryDescription(skill?.description || r.path)} (${scope}, ${r.path})`,
-                  );
-                } else if (kind === "agent") {
-                  const agent = parseCustomAgentProfile(full.content, r.path);
-                  agentLines.push(
-                    `  ${agent?.name || r.path} — ${compactInventoryDescription(agent?.description || "Custom workspace agent")} (${scope}, ${r.path}${agent?.model ? `, model: ${agent.model}` : ""})`,
-                  );
-                } else {
-                  const agent = parseRemoteAgentManifest(full.content, r.path);
-                  agentLines.push(
-                    `  ${agent?.name || r.path} — ${compactInventoryDescription(agent?.description || "Connected A2A agent")} (${scope}, remote via ${r.path})`,
-                  );
+                if (
+                  kind === "skill" ||
+                  kind === "agent" ||
+                  kind === "remote-agent"
+                ) {
+                  const full = await resourceGet(r.id, {
+                    userEmail: ownerEmail,
+                    orgId,
+                  });
+                  if (!full) continue;
+                  if (kind === "skill") {
+                    const skill = parseSkillMetadata(full.content, r.path);
+                    skillLines.push(
+                      `  ${skill?.name || r.path} — ${compactInventoryDescription(skill?.description || r.path)} (${scope}, ${r.path})`,
+                    );
+                  } else if (kind === "agent") {
+                    const agent = parseCustomAgentProfile(full.content, r.path);
+                    agentLines.push(
+                      `  ${agent?.name || r.path} — ${compactInventoryDescription(agent?.description || "Custom workspace agent")} (${scope}, ${r.path}${agent?.model ? `, model: ${agent.model}` : ""})`,
+                    );
+                  } else {
+                    const agent = parseRemoteAgentManifest(
+                      full.content,
+                      r.path,
+                    );
+                    agentLines.push(
+                      `  ${agent?.name || r.path} — ${compactInventoryDescription(agent?.description || "Connected A2A agent")} (${scope}, remote via ${r.path})`,
+                    );
+                  }
                 }
               }
+              const blocks: string[] = [];
+              if (fileLines.length > 0) {
+                const lines = limitInventoryLines(fileLines, "files");
+                blocks.push(
+                  `<available-files>\nFiles in the workspace:\n${lines.join("\n")}\n\nTo read a resource file's contents, use the resources tool with action "read" and the file path.\n</available-files>`,
+                );
+              }
+              if (skillLines.length > 0) {
+                const lines = limitInventoryLines(skillLines, "skills");
+                blocks.push(
+                  `<available-skills>\nSkills in the workspace:\n${lines.join("\n")}\n\nBefore using a matching workspace skill, read its path with the resources tool using action "read"; slash-selected skills are inlined automatically when available.\n</available-skills>`,
+                );
+              }
+              if (agentLines.length > 0) {
+                const lines = limitInventoryLines(agentLines, "agents");
+                blocks.push(
+                  `<available-agents>\nCustom and connected agents in the workspace:\n${lines.join("\n")}\n\nCustom agents under agents/*.md can be mentioned or used via agent-teams (action: "spawn") with the agent parameter.\n</available-agents>`,
+                );
+              }
+              if (jobLines.length > 0) {
+                const lines = limitInventoryLines(jobLines, "jobs");
+                blocks.push(
+                  `<available-jobs>\nScheduled tasks in the workspace:\n${lines.join("\n")}\n</available-jobs>`,
+                );
+              }
+              filesContext =
+                blocks.length > 0 ? `\n\n${blocks.join("\n\n")}` : "";
             }
-            const blocks: string[] = [];
-            if (fileLines.length > 0) {
-              const lines = limitInventoryLines(fileLines, "files");
-              blocks.push(
-                `<available-files>\nFiles in the workspace:\n${lines.join("\n")}\n\nTo read a resource file's contents, use the resources tool with action "read" and the file path.\n</available-files>`,
-              );
-            }
-            if (skillLines.length > 0) {
-              const lines = limitInventoryLines(skillLines, "skills");
-              blocks.push(
-                `<available-skills>\nSkills in the workspace:\n${lines.join("\n")}\n\nBefore using a matching workspace skill, read its path with the resources tool using action "read"; slash-selected skills are inlined automatically when available.\n</available-skills>`,
-              );
-            }
-            if (agentLines.length > 0) {
-              const lines = limitInventoryLines(agentLines, "agents");
-              blocks.push(
-                `<available-agents>\nCustom and connected agents in the workspace:\n${lines.join("\n")}\n\nCustom agents under agents/*.md can be mentioned or used via agent-teams (action: "spawn") with the agent parameter.\n</available-agents>`,
-              );
-            }
-            if (jobLines.length > 0) {
-              const lines = limitInventoryLines(jobLines, "jobs");
-              blocks.push(
-                `<available-jobs>\nScheduled tasks in the workspace:\n${lines.join("\n")}\n</available-jobs>`,
-              );
-            }
-            filesContext =
-              blocks.length > 0 ? `\n\n${blocks.join("\n\n")}` : "";
+          } catch {
+            // Resources not available — skip silently
           }
-        } catch {
-          // Resources not available — skip silently
         }
-      }
-      return filesContext;
-    })();
+        return filesContext;
+      },
+    );
 
+    // DIAGNOSTIC-ONLY: the background worker freezes between `env_config` and
+    // `context_all` when one of the parallel pre-send promises hangs (observed
+    // analytics-only; forms/others claim fine). A single diag field holds only
+    // the latest value, so accumulate the SETTLED set and re-emit it on each
+    // settle — the name MISSING from the last `presend:` breadcrumb is the
+    // hanging step. Each `.finally` runs when its promise settles (freeing its
+    // DB connection), so these persist even under connection-pool pressure.
+    const __psSettled = new Set<string>();
+    const __psMark = (name: string) => {
+      __psSettled.add(name);
+      workerStep("presend:" + [...__psSettled].sort().join("+"));
+    };
+    void systemPromptPromise
+      .finally(() => __psMark("sysprompt"))
+      .catch(() => {});
+    void screenContextPromise.finally(() => __psMark("screen")).catch(() => {});
+    void urlContextPromise.finally(() => __psMark("url")).catch(() => {});
+    void selectionContextPromise
+      .finally(() => __psMark("selection"))
+      .catch(() => {});
+    void filesContextPromise.finally(() => __psMark("files")).catch(() => {});
+    void loopSettingsPromise.finally(() => __psMark("loop")).catch(() => {});
+    void enrichedMessagePromise
+      .finally(() => __psMark("enrich"))
+      .catch(() => {});
+
+    bgLog("presend:awaiting Promise.all");
     const [
       systemPrompt,
       screenBlock,
@@ -4087,6 +4590,11 @@ export function createProductionAgentHandler(
       loopSettingsPromise,
       enrichedMessagePromise,
     ]);
+    setupMark("ctxAll");
+    // DIAGNOSTIC-ONLY: all parallel context gathering (system prompt, screen,
+    // files, loop settings, enriched message) resolved.
+    workerStep("context_all");
+    bgLog("context_all");
 
     if (systemPromptError) {
       setResponseHeader(event, "Content-Type", "text/event-stream");
@@ -4114,6 +4622,10 @@ export function createProductionAgentHandler(
       availableRequestTools,
       options.initialToolNames,
     );
+    setupMark("actions");
+    // DIAGNOSTIC-ONLY: action/tool resolution + engine-tool filtering finished.
+    workerStep("action_tool_setup");
+    bgLog("action_tool_setup");
     const requestSystemPrompt =
       requestMode === "plan"
         ? `${systemPrompt}\n\n${PLAN_MODE_SYSTEM_PROMPT}`
@@ -4153,7 +4665,11 @@ export function createProductionAgentHandler(
     // different serverless isolates both see the correct state — a plain
     // read-then-act check races on multi-isolate deployments because both
     // reads see no running row before either insert commits.
-    if (threadId) {
+    //
+    // The background worker SKIPS this: the foreground POST already claimed the
+    // slot and inserted the run row before dispatching, so re-claiming here
+    // would falsely 409 against the row the foreground holds.
+    if (threadId && !isBackgroundWorker) {
       const slot = await tryClaimRunSlot(threadId);
       if (!slot.claimed) {
         setResponseStatus(event, 409);
@@ -4164,25 +4680,216 @@ export function createProductionAgentHandler(
       }
     }
 
-    // Start agent loop in background via run-manager
-    const runId = generateRunId();
+    // Start agent loop in background via run-manager. The background worker
+    // reuses the runId carried in the marker (signed into the dispatch token):
+    //  - First background chunk (count 0): the foreground generated + INSERTED
+    //    this runId, so the event stream the client is already subscribed to is
+    //    the one we write to.
+    //  - Chained continuation chunk (count > 0): the prior chunk minted a FRESH
+    //    runId for this one (a reused runId would restart `startRun`'s in-memory
+    //    seq log at 0 and collide with the prior chunk's persisted seqs, which
+    //    insertRunEvent's ON CONFLICT would drop — making the continuation
+    //    invisible). A fresh runId on the SAME thread + SAME turnId folds onto
+    //    one assistant message and is surfaced by the existing
+    //    `/runs/active?threadId` reconnect path. The continuation worker inserts
+    //    its own background row below (the foreground only inserted chunk-0's).
+    const isChainedBackgroundContinuation =
+      isBackgroundWorker && backgroundContinuationCount > 0;
+    const runId = backgroundRunMarker?.runId ?? generateRunId();
     const effectiveThreadId = threadId ?? runId;
     const effectiveTurnId =
-      typeof requestTurnId === "string" && requestTurnId.trim()
-        ? requestTurnId.trim()
-        : runId;
+      typeof backgroundRunMarker?.turnId === "string" &&
+      backgroundRunMarker.turnId.trim()
+        ? backgroundRunMarker.turnId.trim()
+        : typeof requestTurnId === "string" && requestTurnId.trim()
+          ? requestTurnId.trim()
+          : runId;
     const messageToPersist =
       typeof requestDisplayMessage === "string" &&
       requestDisplayMessage.trim().length > 0
         ? requestDisplayMessage
         : requestMessage;
-    if (options.onRunPrepared && !internalContinuation) {
+
+    // Server-driven background continuation: when the background worker re-fired
+    // itself at a soft-timeout boundary (a chained continuation chunk), rebuild
+    // the conversation from the persisted thread_data so the next chunk resumes
+    // from committed progress instead of restarting from the original user
+    // message (which would re-do work — the re-hydration thrash the design doc
+    // calls out). Mirrors the agent-teams continuation, which seeds from
+    // thread_data + appends a continuation nudge. Falls back to the body-derived
+    // `messages` if thread_data is empty/unreadable — a continuation that
+    // restarts is worse than one that resumes, but both are correct.
+    if (isChainedBackgroundContinuation && effectiveThreadId) {
+      try {
+        const { getThread } = await import("../chat-threads/store.js");
+        const { threadDataToEngineMessages } =
+          await import("./thread-data-builder.js");
+        const priorThreadData = (await getThread(effectiveThreadId))
+          ?.threadData;
+        const resumed = threadDataToEngineMessages(priorThreadData);
+        if (resumed.length > 0) {
+          appendAgentLoopContinuation(resumed, "run_timeout");
+          messages.length = 0;
+          messages.push(...resumed);
+        }
+      } catch {
+        // Keep the body-derived messages — never drop the run.
+      }
+    }
+    setupMark("depsThread");
+    // DIAGNOSTIC-ONLY: owner/thread resolution + runId/effectiveThreadId +
+    // chained-continuation thread fetch finished.
+    workerStep("owner_thread");
+    bgLog("owner_thread");
+
+    // Persist the user's turn exactly once. The foreground POST does this
+    // before dispatching; the background worker must NOT repeat it (it re-enters
+    // with the same body, which would double-persist the user message).
+    if (options.onRunPrepared && !internalContinuation && !isBackgroundWorker) {
       await options.onRunPrepared({
         runId,
         threadId,
         message: messageToPersist,
         attachments: requestAttachments,
       });
+    }
+
+    // ─── Durable-background dispatch decision ──────────────────────────────
+    // Flag active (hosted + A2A_SECRET + AGENT_CHAT_DURABLE_BACKGROUND) and we
+    // are the FOREGROUND POST: insert the run row (marked background), fire an
+    // HMAC-signed self-dispatch into the Netlify background function (15-min
+    // budget), and return the SSE subscription immediately. The client streams
+    // the same events via the cross-isolate SQL-poll path with no client
+    // change. With the flag OFF this whole branch is skipped and the inline
+    // `startRun` path below runs exactly as before (byte-for-byte).
+    if (dispatchToBackground) {
+      let backgroundRowInserted = false;
+      try {
+        // Insert the run row up front so /runs/active sees it immediately and
+        // the slot stays held while the background function cold-starts. Mark
+        // it background-dispatched so the stale reaper uses the wider window.
+        await insertRun(runId, effectiveThreadId, effectiveTurnId, {
+          dispatchMode: "background",
+        });
+        backgroundRowInserted = true;
+      } catch (err) {
+        // A duplicate-PK collision means the row already exists (ret­ried POST);
+        // any other failure means we can't safely hand off — fall back to the
+        // inline path rather than dropping the turn.
+        console.error(
+          "[agent-chat] background insertRun failed; falling back to inline:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+
+      let dispatched = false;
+      try {
+        await fireInternalDispatch({
+          event,
+          // On hosted Netlify this resolves to the background function's DEFAULT
+          // url (/.netlify/functions/<name>, or per-app <app>-agent-background for
+          // workspaces) — the function declares NO custom config.path, so it keeps
+          // its default url, and `background: true` makes that url async (202,
+          // 15-min budget). The `server` /* catch-all already excludes /.netlify/*
+          // so it never shadows it. Off-Netlify this resolves to the framework
+          // `_process-run` route and the same in-process catch-all handles it
+          // inline. `fireInternalDispatch` strips the app base path for
+          // /.netlify/* targets so the request reaches the host-root function url;
+          // the Authorization Bearer HMAC is preserved either way.
+          path: resolveAgentChatProcessRunDispatchPath(),
+          taskId: runId,
+          body: {
+            ...body,
+            // Carry the pre-claimed identity so the worker reuses this run.
+            [AGENT_CHAT_BACKGROUND_RUN_FIELD]: {
+              runId,
+              turnId: effectiveTurnId,
+            },
+          },
+        });
+        dispatched = true;
+      } catch (err) {
+        console.error(
+          "[agent-chat] background dispatch failed; falling back to inline:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+
+      // ─── Circuit-breaker: a 202 only ENQUEUES the background invocation ─────
+      // It is NOT proof the worker executed. If the generated background-function
+      // wrapper fails to import `./main.mjs` or hand off to the Nitro
+      // `_process-run` route, the worker never reaches `claimBackgroundRun`: the
+      // row sits at `dispatch_mode='background'` until the reaper errors it
+      // ("worker never claimed the run"). `resolveBackgroundDispatchOutcome`
+      // polls briefly for the claim and decides:
+      //   - "stream":    a worker claimed the run → subscribe to it.
+      //   - "subscribe": a (delayed) worker already owns it → subscribe, NEVER
+      //                  run a second copy.
+      //   - "inline":    dispatch failed OR no worker claimed within grace → we
+      //                  atomically own the run; recover by running it inline so a
+      //                  dead worker degrades to a working synchronous turn.
+      const backgroundOutcome = await resolveBackgroundDispatchOutcome({
+        dispatched,
+        backgroundRowInserted,
+        runId,
+        graceMs: BACKGROUND_CLAIM_GRACE_MS,
+        reaperGraceMs: UNCLAIMED_BACKGROUND_RUN_GRACE_MS,
+        pollIntervalMs: BACKGROUND_CLAIM_POLL_MS,
+        readClaim: readBackgroundRunClaim,
+        claim: claimBackgroundRun,
+      });
+
+      if (
+        backgroundOutcome.action === "stream" ||
+        backgroundOutcome.action === "subscribe"
+      ) {
+        const stream = subscribeToRun(runId, 0);
+        if (stream) {
+          setResponseHeader(event, "Content-Type", "text/event-stream");
+          setResponseHeader(event, "Cache-Control", "no-cache");
+          setResponseHeader(event, "Connection", "keep-alive");
+          setResponseHeader(event, "X-Run-Id", runId);
+          return stream;
+        }
+        // A background worker owns this run but we cannot subscribe — surface an
+        // error rather than risk a double-run by falling through to inline.
+        await updateRunStatusIfRunning(runId, "errored").catch(() => {});
+        setResponseStatus(event, 500);
+        return {
+          error:
+            backgroundOutcome.action === "stream"
+              ? "Failed to subscribe to background run"
+              : "Failed to dispatch background run",
+        };
+      }
+
+      // backgroundOutcome.action === "inline": we atomically own the run (or
+      // there was no row to reconcile), so falling through to the inline
+      // `startRun` path below cannot double-execute. `startRun` calls `insertRun`
+      // again, but its duplicate-PK collision is swallowed, so an existing
+      // `background-processing` row is reused — no double row.
+      if (backgroundOutcome.reason === "worker-never-claimed") {
+        // The async 202 landed but no worker claimed within grace. PRESERVE the
+        // bg-fn's last-recorded diag_stage (route_entered / auth_failed / ... or
+        // "none" if it never reached the route) in the recovery detail BEFORE we
+        // overwrite diag_stage — otherwise foreground_inline_recovery clobbers
+        // the only clue to WHY the worker died (its own logs are unreadable).
+        const priorClaim = await readBackgroundRunClaim(runId).catch(
+          () => null,
+        );
+        const priorDiag = priorClaim?.diagStage ?? "none";
+        console.error(
+          "[agent-chat] background worker did not claim the 202-dispatched run " +
+            `within grace; recovering inline. bgFnPriorDiag=${priorDiag}`,
+          runId,
+        );
+        await recordRunDiagnostic(
+          runId,
+          RUN_DIAG_STAGE.foregroundInlineRecovery,
+          `202 dispatched but no worker claimed within grace; bgFnPriorDiag=${priorDiag}`,
+        ).catch(() => {});
+      }
+      // Fall through to the inline `startRun` path below.
     }
 
     const trackedProgressOwner =
@@ -4260,7 +4967,19 @@ export function createProductionAgentHandler(
       }).catch(() => {});
     }
 
-    const handleRunComplete =
+    // The background worker must AWAIT the run to completion before returning,
+    // or Netlify freezes/kills the function the instant the handler returns and
+    // the detached run dies mid-turn (mirrors the agent-teams processor, which
+    // wraps startRun in `await new Promise(resolve => startRun(..., onComplete:
+    // () => resolve()))`). We resolve this when the run's onComplete fires.
+    let resolveBackgroundRunDone: (() => void) | null = null;
+    const backgroundRunDone = isBackgroundWorker
+      ? new Promise<void>((resolve) => {
+          resolveBackgroundRunDone = resolve;
+        })
+      : null;
+
+    const baseHandleRunComplete =
       options.onRunComplete || trackedProgressRunId
         ? async (run: ActiveRun) => {
             try {
@@ -4273,6 +4992,181 @@ export function createProductionAgentHandler(
           }
         : undefined;
 
+    // Wrap so the background worker is unblocked even when there is no app
+    // onRunComplete / tracked-progress callback configured.
+    const handleRunComplete =
+      isBackgroundWorker || baseHandleRunComplete
+        ? async (run: ActiveRun) => {
+            try {
+              // DIAGNOSTIC: a background worker that completed in an errored
+              // state threw inside the loop. Record it (with the last error
+              // event's message when available) so the failure cause is
+              // readable from the client. Skipped for clean completions and for
+              // recoverable soft-timeout boundaries (those chain a continuation
+              // below, they did not "throw").
+              if (
+                isBackgroundWorker &&
+                run.status === "errored" &&
+                !endsAtInternalContinuationBoundary(run)
+              ) {
+                const errEvent = [...run.events]
+                  .reverse()
+                  .find((e) => e.event.type === "error")?.event as
+                  | { error?: string; errorCode?: string }
+                  | undefined;
+                await recordRunDiagnostic(
+                  run.runId,
+                  RUN_DIAG_STAGE.workerThrew,
+                  errEvent?.errorCode || errEvent?.error
+                    ? `${errEvent.errorCode ?? ""} ${errEvent.error ?? ""}`.trim()
+                    : "run ended in errored state",
+                ).catch(() => {});
+              }
+              // Persist the (partial) assistant turn to thread_data FIRST — the
+              // server-driven continuation below rebuilds from it, so it must be
+              // committed before we re-fire.
+              await baseHandleRunComplete?.(run);
+
+              // Server-driven background→background continuation. If this chunk
+              // hit its soft-timeout still unfinished (ended at an auto_continue
+              // / loop_limit / recoverable boundary), chain the next chunk by
+              // re-firing the `_process-run` self-dispatch with mode "continue"
+              // (carried as internalContinuation + an incremented count),
+              // instead of relying on the client to re-POST. Mirrors the
+              // agent-teams `fireInternalDispatch({ body: { mode: "continue" }})`
+              // chain. Bounded by MAX_BACKGROUND_RUN_CONTINUATIONS. Aborted /
+              // user-stopped runs do NOT chain.
+              if (
+                shouldChainBackgroundContinuation({
+                  // Self-chain server-side for EVERY durable worker, not only the
+                  // ones inside a `-background` function. Server-driven
+                  // continuation is the whole point of durable background: the run
+                  // must survive the client disconnecting (closed tab), so it
+                  // cannot depend on the browser re-POSTing `auto_continue`. A
+                  // worker on the regular ~60s function — a Netlify routing miss,
+                  // or a non-Netlify host (Vercel/Cloudflare/Render/Fly) that
+                  // never emits a `-background` function — checkpoints at the 40s
+                  // soft-timeout and self-dispatches the next 40s chunk; a worker
+                  // in a real `-background` function chains ~13-min chunks. Only
+                  // the per-chunk BUDGET differs by function type (gated by
+                  // `runsInBackgroundFunction` at the startRun call below); the
+                  // continuation itself must stay server-driven on both. (The
+                  // self-chain is only reachable when the initial dispatch already
+                  // succeeded — a dispatch fast-fail degrades to the inline
+                  // foreground fallback, which is not a worker and rides the
+                  // connected client's auto_continue instead.)
+                  isBackgroundWorker,
+                  run,
+                  continuationCount: backgroundContinuationCount,
+                })
+              ) {
+                // Mint the next chunk's runId here and sign the dispatch token
+                // over it, so the `_process-run` route's HMAC check and the
+                // worker's run identity agree. Fresh runId (not this chunk's) so
+                // its seq log starts clean; same turnId folds the assistant
+                // message across chunks.
+                const nextRunId = generateRunId();
+                try {
+                  await fireInternalDispatch({
+                    event,
+                    // Continuation chunks use the same path resolution as the
+                    // initial dispatch: on hosted Netlify the background
+                    // function's DEFAULT url (no custom config.path; async via
+                    // background:true; never shadowed because /.netlify/* is
+                    // excluded from the /* catch-all) so each chunk keeps the
+                    // 15-min budget; off-Netlify the in-process framework route.
+                    path: resolveAgentChatProcessRunDispatchPath(),
+                    taskId: nextRunId,
+                    body: {
+                      ...body,
+                      internalContinuation: true,
+                      [AGENT_CHAT_BACKGROUND_RUN_FIELD]: {
+                        runId: nextRunId,
+                        turnId: effectiveTurnId,
+                        continuationCount: backgroundContinuationCount + 1,
+                      },
+                    },
+                  });
+                } catch (chainErr) {
+                  // Chain dispatch failed — fail loud so the held row goes
+                  // terminal instead of spinning. The reaper would also catch
+                  // it, but this is immediate and truthful.
+                  console.error(
+                    "[agent-chat] background continuation dispatch failed:",
+                    chainErr instanceof Error ? chainErr.message : chainErr,
+                  );
+                  await updateRunStatusIfRunning(runId, "errored").catch(
+                    () => {},
+                  );
+                }
+              }
+            } finally {
+              resolveBackgroundRunDone?.();
+            }
+          }
+        : undefined;
+
+    // Background worker: claim the pre-inserted run idempotently before
+    // executing. A duplicate Netlify delivery loses the claim and no-ops here,
+    // so the run can never be double-executed. Bump the heartbeat immediately
+    // on entry so a slow cold-start doesn't leave the row looking stale to the
+    // reaper before startRun's 1.5s heartbeat timer takes over.
+    if (isBackgroundWorker) {
+      // DIAGNOSTIC: the re-entered handler recognized itself as the background
+      // worker. Record the runtime regime too — `isInBackgroundFunctionRuntime()`
+      // reads a globalThis marker set by the bg-fn entry, which may NOT be set in
+      // this isolate; recording the ACTUAL resolved value reveals whether the
+      // worker is on the 13-min `-background` budget or the 40s clamp. This is
+      // the proof the worker reached its own code (vs. dying at auth before it).
+      await recordRunDiagnostic(
+        runId,
+        RUN_DIAG_STAGE.workerEntered,
+        `runsInBackgroundFunction=${runsInBackgroundFunction} continuationCount=${backgroundContinuationCount}`,
+      ).catch(() => {});
+      // A chained continuation chunk's runId was minted by the prior chunk and
+      // never inserted, so insert its background row now (idempotently — a
+      // duplicate Netlify delivery that already inserted it just PK-collides and
+      // the claim below dedups). The first chunk's row was inserted by the
+      // foreground, so skip the insert there.
+      if (isChainedBackgroundContinuation) {
+        await insertRun(runId, effectiveThreadId, effectiveTurnId, {
+          dispatchMode: "background",
+        }).catch(() => {});
+      }
+      bgLog("claim:before");
+      const won = await claimBackgroundRun(runId);
+      bgLog("claim:after won=" + won);
+      if (!won) {
+        // Already claimed by an earlier delivery — return a benign ack so
+        // Netlify doesn't retry a successful handoff.
+        await recordRunDiagnostic(runId, RUN_DIAG_STAGE.workerClaimLost).catch(
+          () => {},
+        );
+        return { ok: true, skipped: "already-claimed" };
+      }
+      // DIAGNOSTIC: this worker won the claim and now OWNS the run. If a run
+      // ever stalls at this stage it means the loop below failed to start.
+      await recordRunDiagnostic(runId, RUN_DIAG_STAGE.workerClaimed).catch(
+        () => {},
+      );
+      await updateRunHeartbeat(runId).catch(() => {});
+    }
+
+    // DIAGNOSTIC-ONLY: build the pre-startRun setup-timing breakdown now (so the
+    // marks reflect the work done BEFORE the loop), but EMIT it from inside
+    // startRun's callback below — the run row does not exist until startRun
+    // inserts it, so a pre-startRun write would no-op on the inline path.
+    setupMark("preStart");
+    // DIAGNOSTIC-ONLY: last stage before startRun fires. A worker that reaches
+    // prestart but never workerStarted is hanging inside startRun itself.
+    workerStep("prestart");
+    bgLog("prestart");
+    const setupDetail =
+      Object.entries(setupMarks)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ") + ` total=${Date.now() - setupT0}`;
+
+    bgLog("startRun:invoked");
     startRun(
       runId,
       effectiveThreadId,
@@ -4283,6 +5177,29 @@ export function createProductionAgentHandler(
         };
 
         send({ type: "activity", label: "Starting agent" });
+
+        // DIAGNOSTIC: the agent loop body actually started running. For a
+        // background worker, a run that is claimed but never reaches this stage
+        // died between claiming and loop start. The pre-startRun setup-timing
+        // breakdown rides along here so it persists now that the run row exists
+        // (startRun inserted it), WITHOUT adding a separate DB hop to the
+        // run-start path: on the worker it is folded into this same
+        // already-awaited worker_started write (one hop, correctly ordered, no
+        // clobber); on the inline path there is no later diag stage to overwrite,
+        // so it is fire-and-forget to keep run-start non-blocking. Best-effort.
+        if (isBackgroundWorker) {
+          await recordRunDiagnostic(
+            runId,
+            RUN_DIAG_STAGE.workerStarted,
+            setupDetail,
+          ).catch(() => {});
+        } else {
+          void recordRunDiagnostic(
+            runId,
+            RUN_DIAG_STAGE.setupTimings,
+            setupDetail,
+          ).catch(() => {});
+        }
 
         // Notify listeners that a run has started (used by agent teams)
         if (options.onRunStart) {
@@ -4661,12 +5578,33 @@ export function createProductionAgentHandler(
       {
         softTimeoutMs: options.runSoftTimeoutMs,
         useHostedSoftTimeoutDefault: true,
+        // Lift the soft-timeout clamp to ~13min ONLY when this run is actually
+        // executing inside a real Netlify `-background` function (15-min budget,
+        // no ~60s wall). Being the `_process-run` worker (`isBackgroundWorker`)
+        // is NOT sufficient: if the `-background` function wasn't emitted, or
+        // Netlify routed the self-POST to the synchronous function, the worker
+        // landed on the regular ~60s `server` function — there it MUST keep the
+        // 40s clamp and checkpoint before the wall, or it overshoots the 60s
+        // hard kill and re-dispatches in a loop. `runsInBackgroundFunction`
+        // gates the 13-min budget on the proven runtime, not merely on "I'm the
+        // worker." Foreground runs never set this, so their 40s clamp is
+        // unchanged.
+        backgroundFunction: runsInBackgroundFunction,
         // Fold continuation runs of one logical turn onto a single durable
         // assistant message. Falls back to the runId (turn == run) when the
         // client doesn't supply a turnId.
         turnId: effectiveTurnId,
       },
     );
+
+    // Background worker: await the run to completion so Netlify keeps the
+    // background function alive for the whole turn (the client is streaming the
+    // same events via the foreground POST's cross-isolate SQL subscription).
+    // The onComplete wrapper above resolves `backgroundRunDone`.
+    if (isBackgroundWorker) {
+      if (backgroundRunDone) await backgroundRunDone;
+      return { ok: true, runId };
+    }
 
     // Subscribe to the run and stream events to the client
     const stream = subscribeToRun(runId, 0);

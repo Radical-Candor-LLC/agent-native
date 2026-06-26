@@ -15,11 +15,12 @@
  */
 
 import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
 import { writeAppState } from "@agent-native/core/application-state";
 import { assertAccess } from "@agent-native/core/sharing";
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
 
 const KIND_PROMPTS = {
   pr: `Compose a pull-request description. Include:
@@ -99,7 +100,8 @@ export default defineAction({
         `(title: "${rec.title}"). Read the transcript from this request's context. ` +
         `${KIND_PROMPTS[args.kind]} ` +
         `Then write the final markdown to application_state key "${stateKey}" as ` +
-        `\`{ kind: "${args.kind}", status: "ready", content: "...", recordingId: "${args.recordingId}" }\`.`,
+        `\`{ kind: "${args.kind}", status: "ready", content: "...", recordingId: "${args.recordingId}" }\`. ` +
+        `Finish by replying in chat with the same generated markdown so the user can read it immediately.`,
     };
 
     await writeAppState(`clips-ai-request-${args.recordingId}`, request as any);

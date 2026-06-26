@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import {
   _agentChatPromptSectionsForTests,
   shouldBlockInProductCodeEditingSurface,
@@ -148,6 +149,49 @@ describe("prompt content invariants", () => {
       expect(prompt).not.toContain("db-query");
       expect(prompt).not.toContain("db-exec");
     }
+  });
+
+  it("read-only database-tool variants keep inspection but route writes to actions", () => {
+    const readOnlyFull = buildFrameworkCore(undefined, {
+      databaseTools: "read",
+    });
+    const readOnlyCompact = buildFrameworkCoreCompact(undefined, {
+      databaseTools: "read",
+    });
+
+    for (const prompt of [readOnlyFull, readOnlyCompact]) {
+      expect(prompt).toContain("db-query");
+      expect(prompt).toContain("typed");
+      expect(prompt).toContain("actions");
+      expect(prompt).toContain("Raw SQL write tools are not available");
+    }
+  });
+
+  it("assembled prompts can remove extension tool guidance", () => {
+    const prompts = _agentChatPromptSectionsForTests.buildFrameworkPrompts(
+      undefined,
+      {
+        extensionTools: false,
+      },
+    );
+    const corePrompt = buildFrameworkCore(undefined, {
+      extensionTools: false,
+    });
+
+    expect(prompts.PROD_FRAMEWORK_PROMPT).toContain("Extensions Disabled");
+    expect(prompts.PROD_FRAMEWORK_PROMPT_COMPACT).toContain(
+      "Extensions Disabled",
+    );
+    expect(corePrompt).toContain("registered actions and connected MCP tools");
+    expect(corePrompt).not.toContain(
+      "registered actions, extensions, and connected MCP tools",
+    );
+    expect(prompts.PROD_FRAMEWORK_PROMPT).not.toContain(
+      "call `create-extension` immediately",
+    );
+    expect(prompts.PROD_FRAMEWORK_PROMPT).not.toContain(
+      "use `create-extension` or `update-extension` instead",
+    );
   });
 
   it("both variants contain the no-fabrication rule", () => {

@@ -1,6 +1,6 @@
-import type { ReasoningEffort } from "../shared/reasoning-effort.js";
-import type { AgentMcpAppPayload } from "../mcp-client/app-result.js";
 import type { ActionChatUIConfig } from "../action-ui.js";
+import type { AgentMcpAppPayload } from "../mcp-client/app-result.js";
+import type { ReasoningEffort } from "../shared/reasoning-effort.js";
 
 export interface AgentNativeJsonSchema {
   type?: string | string[];
@@ -130,6 +130,26 @@ export interface AgentChatRequest {
   /** Internal retry/continuation requests should not create visible user turns. */
   internalContinuation?: boolean;
   /**
+   * Internal marker set ONLY by the durable-background self-dispatch (see
+   * `AGENT_CHAT_BACKGROUND_RUN_FIELD`). Present when the agent-chat handler is
+   * re-entered as the background worker: it carries the pre-claimed `runId` and
+   * logical `turnId` so the worker runs the loop inline with the background
+   * soft-timeout instead of re-claiming the slot or re-dispatching. Untrusted
+   * on its own — the `_process-run` route HMAC-verifies the dispatch before
+   * invoking the handler. Absent on every normal client request.
+   */
+  __backgroundRun?: {
+    runId: string;
+    turnId?: string;
+    /**
+     * Number of server-driven background→background continuations already
+     * chained into this logical turn (0 on the first chunk). The worker
+     * increments this when it re-fires `_process-run` at a soft-timeout
+     * boundary and refuses to chain past `MAX_BACKGROUND_RUN_CONTINUATIONS`.
+     */
+    continuationCount?: number;
+  };
+  /**
    * Stable identity for the logical assistant turn this request belongs to.
    * The client sends the SAME turnId for the initial POST and every
    * auto-continuation re-POST of one turn, so the server can fold each
@@ -169,6 +189,7 @@ export type AgentChatEvent =
   | { type: "text"; text: string }
   | { type: "thinking"; text: string }
   | { type: "activity"; label: string; tool?: string }
+  | { type: "stream_keepalive" }
   | { type: "tool_start"; tool: string; input: Record<string, string> }
   | {
       type: "tool_done";

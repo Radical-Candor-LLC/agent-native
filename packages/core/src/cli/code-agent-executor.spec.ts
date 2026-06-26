@@ -2,16 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
+
 import { afterEach, describe, expect, it } from "vitest";
 
-import {
-  createCodeAgentRunRecord,
-  codeAgentRunTranscriptPath,
-  getCodeAgentRunRecord,
-  listCodeAgentTranscriptEvents,
-  queueCodeAgentFollowUp,
-  updateCodeAgentRunRecord,
-} from "./code-agent-runs.js";
+import type { EngineContentPart } from "../agent/engine/types.js";
+import type { AgentEngine } from "../agent/engine/types.js";
 import {
   buildCodeAgentSystemPrompt,
   buildRepoInstructionsBlock,
@@ -21,9 +16,15 @@ import {
   executeCodeAgentRun,
   executePendingCodeAgentApproval,
 } from "./code-agent-executor.js";
+import {
+  createCodeAgentRunRecord,
+  codeAgentRunTranscriptPath,
+  getCodeAgentRunRecord,
+  listCodeAgentTranscriptEvents,
+  queueCodeAgentFollowUp,
+  updateCodeAgentRunRecord,
+} from "./code-agent-runs.js";
 import type { CodeAgentTranscriptEvent } from "./code-agent-runs.js";
-import type { EngineContentPart } from "../agent/engine/types.js";
-import type { AgentEngine } from "../agent/engine/types.js";
 
 const tmpRoots: string[] = [];
 const providerEnvKeys = [
@@ -117,6 +118,7 @@ describe("executeCodeAgentRun", () => {
     for (const key of providerEnvKeys) delete process.env[key];
     const binDir = path.join(root, "bin");
     const promptPath = path.join(root, "codex-prompt.txt");
+    const argsPath = path.join(root, "codex-args.json");
     fs.mkdirSync(binDir, { recursive: true });
     const codexBin = path.join(binDir, "codex");
     fs.writeFileSync(
@@ -125,6 +127,13 @@ describe("executeCodeAgentRun", () => {
         "#!/usr/bin/env node",
         "const fs = require('fs');",
         "const args = process.argv.slice(2);",
+        `fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(args));`,
+        "const execIndex = args.indexOf('exec');",
+        "const approvalIndex = args.indexOf('--ask-for-approval');",
+        "if (approvalIndex > execIndex) {",
+        "  process.stderr.write(\"unexpected argument '--ask-for-approval' found\");",
+        "  process.exit(2);",
+        "}",
         "const outIndex = args.indexOf('--output-last-message');",
         "const outPath = outIndex === -1 ? '' : args[outIndex + 1];",
         "let input = '';",
@@ -163,6 +172,10 @@ describe("executeCodeAgentRun", () => {
     });
     expect(output.read()).toContain("Codex streamed output");
     expect(fs.readFileSync(promptPath, "utf-8")).toContain("fix auth tests");
+    const args = JSON.parse(fs.readFileSync(argsPath, "utf-8")) as string[];
+    const execIndex = args.indexOf("exec");
+    expect(args.slice(0, 3)).toEqual(["--ask-for-approval", "never", "exec"]);
+    expect(args.slice(execIndex + 1)).not.toContain("--ask-for-approval");
     expect(listCodeAgentTranscriptEvents(run.id)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -832,6 +845,46 @@ describe("buildCodeAgentSystemPrompt", () => {
     expect(prompt).toContain("my-feature");
     expect(prompt).toContain("Explains how to add new features.");
     expect(prompt).toContain("SKILL.md");
+  });
+
+  it("includes dev-scoped skills and omits runtime-only skills", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "an-prompt-scope-"));
+    tmpRoots.push(root);
+    fs.mkdirSync(path.join(root, ".agents", "skills", "dev-skill"), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(root, ".agents", "skills", "dev-skill", "SKILL.md"),
+      [
+        "---",
+        "name: dev-skill",
+        "description: For connected repo agents.",
+        "scope: dev",
+        "---",
+        "# Dev Skill",
+      ].join("\n"),
+    );
+    fs.mkdirSync(path.join(root, ".agents", "skills", "runtime-skill"), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(root, ".agents", "skills", "runtime-skill", "SKILL.md"),
+      [
+        "---",
+        "name: runtime-skill",
+        "description: For deployed app agents.",
+        "scope: runtime",
+        "---",
+        "# Runtime Skill",
+      ].join("\n"),
+    );
+
+    const prompt = await buildCodeAgentSystemPrompt(root, "full-auto");
+
+    expect(prompt).toContain("dev-skill");
+    expect(prompt).toContain("For connected repo agents.");
+    expect(prompt).not.toContain("runtime-skill");
+    expect(prompt).not.toContain("For deployed app agents.");
   });
 
   it("omits skills section when no skills directory exists", async () => {

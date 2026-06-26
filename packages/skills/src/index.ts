@@ -90,7 +90,7 @@ export interface InstallSkillsResult {
 }
 
 interface ParsedArgs {
-  command: "add" | "list" | "help";
+  command: "add" | "list" | "status" | "update" | "help";
   source?: string;
   copySource: boolean;
   skillNames: string[];
@@ -147,6 +147,8 @@ const HELP = `@agent-native/skills
 Usage:
   npx @agent-native/skills@latest add [options]
   npx @agent-native/skills@latest list
+  npx @agent-native/skills@latest status [skill|scaffold] [options]
+  npx @agent-native/skills@latest update [skill|scaffold] [options]
 
 Options:
   --skill <name>              Install only this skill (repeatable)
@@ -159,8 +161,8 @@ Options:
   --no-update-instructions    Skip managed instruction file updates
   --instructions-file <path>  File to receive managed instructions (repeatable)
   --with-github-action        Add .github/workflows/pr-visual-recap.yml when visual-recap is installed
-  --mode <mode>               visual-plan/visual-recap mode: hosted, local-files, or self-hosted
-  --mcp-url <url>             Self-hosted app/MCP URL for visual-plan/visual-recap
+  --mode <mode>               App-backed skill mode: hosted, local-files, or self-hosted
+  --mcp-url <url>             Self-hosted app/MCP URL for app-backed skills
   --force                     Overwrite a different existing PR Visual Recap workflow
   --no-mcp                    Install skill files only; skip registering the app's MCP server
   --no-connect                Register MCP where possible but skip inline browser/device authentication
@@ -168,16 +170,17 @@ Options:
   --dry-run                   Print intended writes without changing files
   --json                      Print the result as JSON
 
-App-backed skills (visual-plan, visual-recap) register their hosted MCP server
-in your agent config by default so the agent can actually use them. Use
+App-backed skills (visual-plan, visual-recap, content) register their hosted MCP
+server in your agent config by default so the agent can actually use them. Use
 --no-mcp to skip that and copy the files only.
-For visual-plan/visual-recap, choose --mode local-files for no sharing and all
-local files, or --mode self-hosted --mcp-url <url> for your own Plan app.
+For visual-plan/visual-recap/content, choose --mode local-files for local-file
+workflows, or --mode self-hosted --mcp-url <url> for your own app.
 
 Examples:
   npx @agent-native/skills@latest add
   npx @agent-native/skills@latest add --skill quick-recap
   npx @agent-native/skills@latest add --skill visual-recap --with-github-action
+  npx @agent-native/skills@latest update scaffold --project
 `;
 
 const CLIENTS: SkillClient[] = [
@@ -199,8 +202,20 @@ export function parseSkillsCliArgs(argv: string[]): ParsedArgs {
     return defaultArgs("help");
   }
 
-  const command = first === "list" ? "list" : "add";
-  const args = first === "add" || first === "list" ? argv.slice(1) : argv;
+  const command =
+    first === "list" ||
+    first === "status" ||
+    first === "update" ||
+    first === "add"
+      ? first
+      : "add";
+  const args =
+    first === "add" ||
+    first === "list" ||
+    first === "status" ||
+    first === "update"
+      ? argv.slice(1)
+      : argv;
   const out = defaultArgs(command);
 
   for (let i = 0; i < args.length; i += 1) {
@@ -268,12 +283,21 @@ export function parseSkillsCliArgs(argv: string[]): ParsedArgs {
     else throw new Error(`Unexpected argument: ${arg}`);
   }
 
-  if (out.source && out.source !== DEFAULT_SKILLS_SOURCE && !out.copySource) {
+  if (
+    out.command === "add" &&
+    out.source &&
+    out.source !== DEFAULT_SKILLS_SOURCE &&
+    !out.copySource
+  ) {
     throw new Error(
       `Unexpected argument: ${out.source}. @agent-native/skills installs the BuilderIO skills collection; use --skill <name> to choose a skill.`,
     );
   }
-  if (out.source === DEFAULT_SKILLS_SOURCE && !out.copySource) {
+  if (
+    out.command === "add" &&
+    out.source === DEFAULT_SKILLS_SOURCE &&
+    !out.copySource
+  ) {
     out.source = undefined;
   }
 
@@ -316,11 +340,24 @@ function toCoreSkillsArgv(parsed: ParsedArgs): string[] {
         for (const skill of parsed.skillNames) out.push("--skill", skill);
       }
     }
+  } else if (parsed.command === "status" || parsed.command === "update") {
+    if (parsed.source) out.push(parsed.source);
+    else if (parsed.skillNames.length === 1) out.push(parsed.skillNames[0]);
   }
-  if (parsed.command === "add" && parsed.clients.length) {
+  if (
+    (parsed.command === "add" ||
+      parsed.command === "status" ||
+      parsed.command === "update") &&
+    parsed.clients.length
+  ) {
     out.push("--client", parsed.clients.join(","));
   }
-  if (parsed.command === "add" && parsed.scopeExplicit) {
+  if (
+    (parsed.command === "add" ||
+      parsed.command === "status" ||
+      parsed.command === "update") &&
+    parsed.scopeExplicit
+  ) {
     out.push("--scope", parsed.scope);
   }
   if (parsed.command === "add" && parsed.yes) out.push("--yes");
@@ -353,9 +390,22 @@ function shouldLoadPublicCatalog(parsed: ParsedArgs): boolean {
 
 const HIDDEN_STANDALONE_BUILT_INS = [
   "assets",
+  "content",
   "design-exploration",
   "context-xray",
 ];
+
+function shouldShowDelegatedStartupProgress(
+  parsed: ParsedArgs,
+  options: Pick<InstallSkillsOptions, "isInteractive">,
+): boolean {
+  return (
+    parsed.command !== "help" &&
+    !parsed.printJson &&
+    !parsed.quiet &&
+    cliInteractive(parsed, options)
+  );
+}
 
 export async function runSkillsCli(
   argv: string[],
@@ -384,6 +434,9 @@ export async function runSkillsCli(
     if (parsed.command === "help") {
       process.stdout.write(`${HELP}\n`);
       return;
+    }
+    if (shouldShowDelegatedStartupProgress(parsed, options)) {
+      process.stderr.write("Preparing Agent Native skills...\n");
     }
     const loadedSource = shouldLoadPublicCatalog(parsed)
       ? await materializeSource(parsed.source ?? DEFAULT_SKILLS_SOURCE)
@@ -591,10 +644,12 @@ export async function installSkills(
     });
 
     const skillNames = selected.map((skill) => skill.name);
+    const modeAwareApp = selectedModeAwareApp(skillNames);
     const planMode = await resolvePlanModeForSkills(skillNames, options);
     const planMcpOverride = await resolvePlanMcpOverrideForMode(
       planMode,
       options,
+      modeAwareApp?.appId,
     );
 
     const clients = await resolveSelectedClients(options);
@@ -802,28 +857,35 @@ function defaultArgs(command: ParsedArgs["command"]): ParsedArgs {
   };
 }
 
-function selectedPlanApp(skillNames: string[]): BuiltInAppMcp | undefined {
+function selectedModeAwareApp(skillNames: string[]): BuiltInAppMcp | undefined {
   return skillNames
     .map((skillName) => resolveAppForSkill(skillName))
-    .find((app): app is BuiltInAppMcp => app?.appId === "visual-plans");
+    .find(
+      (app): app is BuiltInAppMcp =>
+        app?.appId === "visual-plans" || app?.appId === "content",
+    );
 }
 
 async function resolvePlanModeForSkills(
   skillNames: string[],
   options: InstallSkillsOptions,
 ): Promise<PlanMode | undefined> {
-  const includesPlans = Boolean(selectedPlanApp(skillNames));
-  if (options.planMode && !includesPlans) {
-    throw new Error("--mode only applies to visual-plan / visual-recap.");
+  const modeAwareApp = selectedModeAwareApp(skillNames);
+  if (options.planMode && !modeAwareApp) {
+    throw new Error(
+      "--mode only applies to visual-plan / visual-recap / content.",
+    );
   }
-  if (options.mcpUrl && !includesPlans) {
-    throw new Error("--mcp-url only applies to visual-plan / visual-recap.");
+  if (options.mcpUrl && !modeAwareApp) {
+    throw new Error(
+      "--mcp-url only applies to visual-plan / visual-recap / content.",
+    );
   }
-  if (!includesPlans) return undefined;
+  if (!modeAwareApp) return undefined;
 
   if (options.mcpUrl && !options.planMode) return "self-hosted";
   if (options.planMode) return options.planMode;
-  return "hosted";
+  return modeAwareApp.appId === "visual-plans" ? "hosted" : undefined;
 }
 
 function resolvePlanMcpUrlOverride(input: string): {
@@ -856,7 +918,8 @@ function resolvePlanMcpUrlOverride(input: string): {
 async function resolvePlanMcpOverrideForMode(
   planMode: PlanMode | undefined,
   options: InstallSkillsOptions,
-): Promise<{ hostedUrl: string; mcpUrl: string } | undefined> {
+  appId: string | undefined,
+): Promise<{ appId: string; hostedUrl: string; mcpUrl: string } | undefined> {
   if (planMode === "local-files" && options.mcpUrl) {
     throw new Error("--mode local-files cannot be combined with --mcp-url.");
   }
@@ -866,7 +929,10 @@ async function resolvePlanMcpOverrideForMode(
       "--mode self-hosted requires --mcp-url <url> in direct mode.",
     );
   }
-  return resolvePlanMcpUrlOverride(options.mcpUrl);
+  if (!appId) {
+    throw new Error("--mode self-hosted requires an app-backed skill.");
+  }
+  return { appId, ...resolvePlanMcpUrlOverride(options.mcpUrl) };
 }
 
 function parsePlanMode(value: string): PlanMode {
@@ -997,7 +1063,7 @@ async function createInstallProgress(
 
 function mcpAppsForSkills(
   skillNames: string[],
-  planOverride?: { hostedUrl: string; mcpUrl: string },
+  planOverride?: { appId: string; hostedUrl: string; mcpUrl: string },
 ): BuiltInAppMcp[] {
   const apps: BuiltInAppMcp[] = [];
   const seen = new Set<string>();
@@ -1005,7 +1071,7 @@ function mcpAppsForSkills(
     const app = resolveAppForSkill(skillName);
     if (!app || seen.has(app.appId)) continue;
     seen.add(app.appId);
-    if (app.appId === "visual-plans" && planOverride) {
+    if (app.appId === planOverride?.appId) {
       apps.push({
         ...app,
         hostedUrl: planOverride.hostedUrl,
@@ -1050,7 +1116,7 @@ async function printInstallResult(
     `Skills        ${result.skills.join(", ") || "none"}`,
     `Agents        ${result.clients.join(", ") || "none"}`,
     `Scope         ${result.scope}`,
-    result.planMode ? `Plan mode     ${result.planMode}` : "",
+    result.planMode ? `Install mode  ${result.planMode}` : "",
     result.written.length
       ? `Skill folders ${plural(result.written.length, "folder")} (${summarizePaths(
           result.written,
@@ -1091,7 +1157,12 @@ async function printInstallResult(
     }
   }
 
-  if (result.planMode === "local-files") {
+  if (
+    result.planMode === "local-files" &&
+    result.skills.some((skill) =>
+      ["visual-plan", "visual-recap"].includes(skill),
+    )
+  ) {
     clack.note(
       [
         "No sharing, all local.",

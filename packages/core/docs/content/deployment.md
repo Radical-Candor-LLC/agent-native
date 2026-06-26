@@ -95,12 +95,11 @@ The output is self-contained — copy `.output/` to any environment and run it.
 By default, Nitro builds for Node.js. To target a different platform, set the preset in your `vite.config.ts`:
 
 ```ts
-import { defineConfig } from "@agent-native/core/vite";
+import { agentNative } from "@agent-native/core/vite";
+import { defineConfig } from "vite";
 
 export default defineConfig({
-  nitro: {
-    preset: "vercel",
-  },
+  plugins: [agentNative({ nitro: { preset: "vercel" } })],
 });
 ```
 
@@ -151,7 +150,7 @@ CMD ["node", ".output/server/index.mjs"]
 ```ts
 // vite.config.ts
 export default defineConfig({
-  nitro: { preset: "vercel" },
+  plugins: [agentNative({ nitro: { preset: "vercel" } })],
 });
 ```
 
@@ -182,7 +181,7 @@ The Nitro `netlify` preset works well and, in practice, has given us much faster
 ```ts
 // vite.config.ts
 export default defineConfig({
-  nitro: { preset: "netlify" },
+  plugins: [agentNative({ nitro: { preset: "netlify" } })],
 });
 ```
 
@@ -201,7 +200,7 @@ The workspace build writes static assets under `dist/_workspace_static/` and rou
 ```ts
 // vite.config.ts
 export default defineConfig({
-  nitro: { preset: "cloudflare_pages" },
+  plugins: [agentNative({ nitro: { preset: "cloudflare_pages" } })],
 });
 ```
 
@@ -210,7 +209,7 @@ export default defineConfig({
 ```ts
 // vite.config.ts
 export default defineConfig({
-  nitro: { preset: "aws_lambda" },
+  plugins: [agentNative({ nitro: { preset: "aws_lambda" } })],
 });
 ```
 
@@ -219,7 +218,7 @@ export default defineConfig({
 ```ts
 // vite.config.ts
 export default defineConfig({
-  nitro: { preset: "deno_deploy" },
+  plugins: [agentNative({ nitro: { preset: "deno_deploy" } })],
 });
 ```
 
@@ -274,6 +273,33 @@ openssl rand -hex 32
 ```
 
 Rotate them by replacing the env var on every instance and redeploying — sessions / OAuth state envelopes signed under the old key become invalid, so users may need to sign in again.
+
+## Production Agent Tools {#production-agent-tools}
+
+Production agents get the app's registered actions plus framework tools from
+the agent chat plugin. Database writes are enabled by default because raw DB
+tools are scoped to the authenticated user/org, but app owners can narrow the
+surface when a deployment should be more opinionated:
+
+```ts
+// server/plugins/agent-chat.ts
+export default createAgentChatPlugin({
+  // Default: "write" (also true)
+  databaseTools: "read", // "write" | "read" | "off"
+  extensionTools: false,
+});
+```
+
+- `databaseTools: "write"` — default. Registers `db-schema`, `db-query`,
+  `db-exec`, and `db-patch`. Writes are scoped to the current user/org and
+  schema changes are blocked.
+- `databaseTools: "read"` — registers only `db-schema` and `db-query`; agents
+  inspect data with SQL but must use typed app actions for writes.
+- `databaseTools: "off"` or `false` — removes raw database tools from the
+  agent surface so the app's actions are the only data access path.
+- `extensionTools: false` — removes framework extension-management actions and
+  prompt guidance (`create-extension`, `update-extension`, etc.) for apps that
+  do not want the agent creating sandboxed mini-apps.
 
 ## Production Code Execution {#production-code-execution}
 

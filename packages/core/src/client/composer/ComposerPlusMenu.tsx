@@ -1,5 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
-import { createPortal } from "react-dom";
+import { useComposerRuntime } from "@assistant-ui/react";
 import {
   IconPlus,
   IconUpload,
@@ -14,15 +13,22 @@ import {
   IconArrowLeft,
   IconX,
 } from "@tabler/icons-react";
-import { ComposerPrimitive } from "@assistant-ui/react";
-import { cn } from "../utils.js";
+import React, { useState, useRef, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
+
+import { setAgentChatContextItem } from "../agent-chat.js";
+import { agentNativePath } from "../api-path.js";
 import {
   Popover,
   PopoverTrigger,
   PopoverContent,
 } from "../components/ui/popover.js";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "../components/ui/tooltip.js";
 import { useOrg } from "../org/hooks.js";
-import { agentNativePath } from "../api-path.js";
 import {
   formatMcpServerError,
   getMcpUrlValidationError,
@@ -30,16 +36,12 @@ import {
   testMcpServerUrl,
   type McpServerScope,
 } from "../resources/use-mcp-servers.js";
+import { cn } from "../utils.js";
 import type { ComposerMode } from "./types.js";
-import { setAgentChatContextItem } from "../agent-chat.js";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "../components/ui/tooltip.js";
 
 interface ComposerPlusMenuProps {
   onSelectMode?: (mode: ComposerMode) => void;
+  onAttachmentError?: (message: string) => void;
   /**
    * "full" (default): full + menu with Upload File, Create Skill, Schedule Task,
    * Automation, Extension, MCP Server. "upload-only": clicking + opens the file
@@ -179,40 +181,80 @@ function slugifyName(value: string): string {
   );
 }
 
-function UploadOnlyAttachButton() {
+function formatAttachmentError(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function UploadOnlyAttachButton({
+  onAttachmentError,
+}: Pick<ComposerPlusMenuProps, "onAttachmentError">) {
+  const composerRuntime = useComposerRuntime();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const handleFilesSelected = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    try {
+      await Promise.all(
+        Array.from(files).map((file) => composerRuntime.addAttachment(file)),
+      );
+    } catch (error) {
+      onAttachmentError?.(
+        formatAttachmentError(error, "Could not upload the selected file."),
+      );
+    }
+  };
+
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span className="inline-flex shrink-0">
-          <ComposerPrimitive.AddAttachment asChild>
+    <>
+      <input
+        ref={inputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(event) => {
+          void handleFilesSelected(event.target.files);
+          event.target.value = "";
+        }}
+      />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex shrink-0">
             <button
               type="button"
               className="shrink-0 flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-accent/50"
               aria-label="Upload"
+              onClick={() => inputRef.current?.click()}
             >
               <IconPlus className="h-4 w-4" />
             </button>
-          </ComposerPrimitive.AddAttachment>
-        </span>
-      </TooltipTrigger>
-      <TooltipContent>Upload</TooltipContent>
-    </Tooltip>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>Upload</TooltipContent>
+      </Tooltip>
+    </>
   );
 }
 
 export function ComposerPlusMenu({
   onSelectMode,
+  onAttachmentError,
   mode = "full",
 }: ComposerPlusMenuProps) {
   if (mode === "upload-only") {
-    return <UploadOnlyAttachButton />;
+    return <UploadOnlyAttachButton onAttachmentError={onAttachmentError} />;
   }
-  return <ComposerPlusMenuFull onSelectMode={onSelectMode} />;
+  return (
+    <ComposerPlusMenuFull
+      onSelectMode={onSelectMode}
+      onAttachmentError={onAttachmentError}
+    />
+  );
 }
 
 function ComposerPlusMenuFull({
   onSelectMode,
-}: Pick<ComposerPlusMenuProps, "onSelectMode">) {
+  onAttachmentError,
+}: Pick<ComposerPlusMenuProps, "onSelectMode" | "onAttachmentError">) {
+  const composerRuntime = useComposerRuntime();
   const [open, setOpen] = useState(false);
   const [assetsPickerOpen, setAssetsPickerOpen] = useState(false);
   const [view, setView] = useState<View>("menu");
@@ -238,7 +280,7 @@ function ComposerPlusMenuFull({
   const createMcp = useCreateMcpServer();
 
   const inputRef = useRef<HTMLInputElement>(null);
-  const fileUploadRef = useRef<HTMLButtonElement>(null);
+  const fileUploadRef = useRef<HTMLInputElement>(null);
   const skillFileInputRef = useRef<HTMLInputElement>(null);
   const skillHoverTimerRef = useRef<number | null>(null);
   const [skillUploadSlug, setSkillUploadSlug] = useState("");
@@ -399,6 +441,19 @@ function ComposerPlusMenuFull({
     setView("skill-upload");
   };
 
+  const handleFilesSelected = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    try {
+      await Promise.all(
+        Array.from(files).map((file) => composerRuntime.addAttachment(file)),
+      );
+    } catch (error) {
+      onAttachmentError?.(
+        formatAttachmentError(error, "Could not upload the selected file."),
+      );
+    }
+  };
+
   const submitSkillUpload = async () => {
     if (skillUploadBusy) return;
     const slug = slugifyName(skillUploadSlug || "uploaded-skill");
@@ -511,24 +566,24 @@ function ComposerPlusMenuFull({
       }}
       className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground mb-1.5"
     >
-      <IconArrowLeft className="h-3 w-3" />
+      <IconArrowLeft className="h-3 w-3 rtl:-scale-x-100" />
       Back
     </button>
   );
 
   return (
     <>
-      {/* Hidden button to trigger the native file upload */}
-      <ComposerPrimitive.AddAttachment asChild>
-        <button
-          ref={fileUploadRef}
-          type="button"
-          className="hidden"
-          style={{ display: "none" }}
-          tabIndex={-1}
-          aria-hidden
-        />
-      </ComposerPrimitive.AddAttachment>
+      {/* Hidden input to trigger the native file upload with explicit errors. */}
+      <input
+        ref={fileUploadRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(event) => {
+          void handleFilesSelected(event.target.files);
+          event.target.value = "";
+        }}
+      />
       <input
         ref={skillFileInputRef}
         type="file"
@@ -602,7 +657,7 @@ function ComposerPlusMenuFull({
                       type="button"
                       onClick={item.action}
                       className={cn(
-                        "flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-accent/50",
+                        "flex w-full items-center gap-2.5 px-3 py-2 text-start hover:bg-accent/50",
                         isSkill && skillFlyoutOpen && "bg-accent/50",
                       )}
                     >
@@ -616,7 +671,7 @@ function ComposerPlusMenuFull({
                         </div>
                       </div>
                       {isSkill && (
-                        <span className="ml-auto text-muted-foreground/60">
+                        <span className="ms-auto text-muted-foreground/60">
                           ›
                         </span>
                       )}
@@ -640,7 +695,7 @@ function ComposerPlusMenuFull({
                             setSkillFlyoutOpen(false);
                             setOpen(false);
                           }}
-                          className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-accent/50"
+                          className="flex w-full items-center gap-2.5 px-3 py-2 text-start hover:bg-accent/50"
                         >
                           <span className="text-muted-foreground">
                             <IconBulb className="h-3.5 w-3.5" />
@@ -660,7 +715,7 @@ function ComposerPlusMenuFull({
                             setSkillFlyoutOpen(false);
                             skillFileInputRef.current?.click();
                           }}
-                          className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-accent/50"
+                          className="flex w-full items-center gap-2.5 px-3 py-2 text-start hover:bg-accent/50"
                         >
                           <span className="text-muted-foreground">
                             <IconUpload className="h-3.5 w-3.5" />
@@ -689,7 +744,7 @@ function ComposerPlusMenuFull({
                 onClick={() => setView("menu")}
                 className="mb-1.5 flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
               >
-                <IconArrowLeft className="h-3 w-3" />
+                <IconArrowLeft className="h-3 w-3 rtl:-scale-x-100" />
                 Back
               </button>
               <label className="mb-1 block text-[11px] font-semibold text-foreground">

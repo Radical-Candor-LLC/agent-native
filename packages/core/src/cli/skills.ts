@@ -4,14 +4,13 @@
  * command handles the common "install Assets for my agent" path in one step.
  */
 
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-import { createCliTelemetry, type CliTelemetry } from "./telemetry.js";
 import {
   buildAppSkillPack,
   ensureAppSkill,
@@ -31,18 +30,21 @@ import {
 } from "./context-xray-local.js";
 import { CLIENTS, type ClientId } from "./mcp-config-writers.js";
 import { PR_VISUAL_RECAP_SETUP, writePrVisualRecapWorkflow } from "./recap.js";
+import { setupAgentSymlinks } from "./setup-agents.js";
+import { createCliTelemetry, type CliTelemetry } from "./telemetry.js";
 
 const HELP = `npx @agent-native/core@latest skills
 
 Usage:
   npx @agent-native/core@latest skills list
-  npx @agent-native/core@latest skills status [assets|design-exploration|visual-plan|visual-recap|context-xray] [--client codex|claude-code|pi|all] [--scope user|project] [--json]
-  npx @agent-native/core@latest skills update [assets|design-exploration|visual-plan|visual-recap|context-xray] [--client codex|claude-code|pi|all] [--scope user|project] [--dry-run] [--json]
-  npx @agent-native/core@latest skills add assets|design-exploration|visual-plan|visual-recap|context-xray [--client codex|claude-code|cowork|cursor|opencode|github-copilot|all] [--scope user|project] [--mode hosted|local-files|self-hosted] [--mcp-url <url>] [--no-connect] [--with-github-action] [--yes] [--dry-run] [--json]
+  npx @agent-native/core@latest skills status [assets|content|design-exploration|visual-plan|visual-recap|context-xray|scaffold] [--client codex|claude-code|pi|all] [--scope user|project] [--json]
+  npx @agent-native/core@latest skills update [assets|content|design-exploration|visual-plan|visual-recap|context-xray|scaffold] [--client codex|claude-code|pi|all] [--scope user|project] [--dry-run] [--json]
+  npx @agent-native/core@latest skills add assets|content|design-exploration|visual-plan|visual-recap|context-xray [--client codex|claude-code|cowork|cursor|opencode|github-copilot|all] [--scope user|project] [--mode hosted|local-files|self-hosted] [--mcp-url <url>] [--no-connect] [--with-github-action] [--yes] [--dry-run] [--json]
   npx @agent-native/core@latest skills add <manifest-or-app-dir|skill-repo> [--skill <name>] [--client ...] [--yes]
 
 Examples:
   npx @agent-native/core@latest skills add assets
+  npx @agent-native/core@latest skills add content --mode local-files
   npx @agent-native/core@latest skills add design-exploration
   npx @agent-native/core@latest skills add visual-plan
   npx @agent-native/core@latest skills add visual-recap
@@ -51,6 +53,7 @@ Examples:
   npx @agent-native/core@latest skills add visual-plan --mode self-hosted --mcp-url https://my-plan-app.example.com
   npx @agent-native/core@latest skills status visual-plan
   npx @agent-native/core@latest skills update visual-plan
+  npx @agent-native/core@latest skills update scaffold --project
   npx @agent-native/core@latest skills add visual-plan --no-connect
   npx @agent-native/core@latest skills add context-xray --client all
   npx @agent-native/core@latest skills add assets --client claude-code
@@ -88,13 +91,22 @@ Pass --mode to choose directly. Local-files mode skips MCP registration and
 auth and installs instructions that default to a no-auth block catalog fetch,
 MDX folders, and the localhost bridge viewer.
 
+When installing content with --mode local-files, the CLI installs Content
+instructions and writes or updates agent-native.json with repo-backed Markdown /
+MDX roots for docs, blog, content, and resources. Use a local Content app, Agent
+Native Desktop, or another trusted local bridge for Content actions to read and
+write those files.
+
 When installing visual-recap interactively, the CLI offers to add the optional PR
 Visual Recap GitHub Action. Pass --with-github-action to write it directly, then
 run "npx @agent-native/core@latest recap setup" / "npx @agent-native/core@latest recap doctor" to configure and
 verify GitHub Actions. Docs: https://www.agent-native.com/docs/pr-visual-recap.
 
 The status/update commands inspect copied Agent Native skill folders and refresh
-their instruction files from the current @agent-native/core package.`;
+their instruction files from the current @agent-native/core package. In generated
+apps/workspaces, "skills update scaffold --project" refreshes the framework
+skills copied into the scaffold and repairs AGENTS.md / CLAUDE.md and
+.agents/skills / .claude/skills compatibility links.`;
 
 const ASSETS_SKILL_MD = `---
 name: assets
@@ -178,6 +190,116 @@ of using a generic image generator.
   \`count: 1\` only after telling the user the multi-candidate request timed out.
 - If you inspect local MCP config, redact \`Authorization\`, \`http_headers\`,
   and token values. Never paste bearer tokens into chat or logs.
+`;
+
+const CONTENT_SKILL_MD = `---
+name: content
+description: >-
+  Use Content for repo-backed Markdown/MDX docs, blogs, resources, rich
+  document editing, local components, shareable copies, and Content local-file
+  workspaces. Prefer Content actions over raw filesystem writes when available.
+metadata:
+  visibility: exported
+---
+
+# Content
+
+Use the Content app when a workflow is about authoring, editing, reviewing, or
+publishing Markdown/MDX documents: docs sites, blogs, resource libraries,
+marketing pages, internal notes, and local MDX components. Content gives the
+agent a document tree, a rich editor, normal document actions, and optional
+local-file source of truth.
+
+## Choose The Path
+
+- Use Content actions when the Content MCP/action tools are available:
+  \`list-documents\`, \`search-documents\`, \`get-document\`,
+  \`pull-document\`, \`create-document\`, \`edit-document\`,
+  \`update-document\`, \`delete-document\`, \`share-local-file-document\`,
+  \`list-local-component-files\`, and \`write-local-component-file\`.
+- Use \`pull-document\` or \`get-document\` before editing a page. Use
+  \`edit-document\` for precise find/replace changes and \`update-document\`
+  for full rewrites or new content.
+- In Local File Mode, Content actions read and write the repo files declared in
+  \`agent-native.json\`; SQL remains cache/history/search glue, not the source of
+  truth for those pages.
+- If Content tools are not visible and no local Content app or Desktop bridge is
+  running, treat this skill as repo-editing guidance. Edit configured
+  \`.md\`/\`.mdx\` files directly, preserve frontmatter and MDX imports, and tell
+  the user the Content action surface was not available.
+
+## Action Examples
+
+Prefer JSON input for action calls:
+
+\`\`\`bash
+pnpm action list-documents
+pnpm action get-document '{"id":"local-file:..."}'
+pnpm action edit-document '{"id":"local-file:...","find":"old copy","replace":"new copy"}'
+pnpm action update-document '{"id":"local-file:...","content":"# Updated\\n\\nBody"}'
+pnpm action share-local-file-document '{"id":"local-file:..."}'
+\`\`\`
+
+Run \`refresh-list\` after create/update/delete operations when you need the
+open Content UI sidebar to repaint immediately.
+
+## Local File Mode
+
+Install into an existing repo with:
+
+\`\`\`bash
+npx @agent-native/core@latest skills add content --mode local-files --scope project
+\`\`\`
+
+The installer copies this skill and writes or updates \`agent-native.json\` with
+Content roots for \`docs/\`, \`blog/\`, \`content/\`, and \`resources/\`, plus a
+\`components/\` folder for local MDX components. A typical manifest looks like:
+
+\`\`\`json
+{
+  "version": 1,
+  "apps": {
+    "content": {
+      "mode": "local-files",
+      "roots": [
+        { "name": "Docs", "path": "docs", "kind": "docs", "extensions": [".md", ".mdx"] },
+        { "name": "Blog", "path": "blog", "kind": "blog", "extensions": [".md", ".mdx"] },
+        { "name": "Content", "path": "content", "kind": "content", "extensions": [".md", ".mdx"] },
+        { "name": "Resources", "path": "resources", "kind": "resources", "extensions": [".md", ".mdx"] }
+      ],
+      "components": "components",
+      "extensions": "extensions",
+      "hide": ["**/_*.md", "**/_*.mdx"]
+    }
+  }
+}
+\`\`\`
+
+Local File Mode does not make the host language model local, and the hosted
+Content app cannot read private repo files by itself. File access requires a
+local Content app, Agent Native Desktop, or another trusted local bridge.
+
+## MDX And Components
+
+- Preserve frontmatter keys you do not understand. Preserve MDX imports,
+  exports, JSX, and expression props unless the user explicitly asks to change
+  them.
+- Use local components from the configured \`components\` folder. Components
+  should be PascalCase exports from \`.tsx\` files; simple editable input metadata
+  can live next to them as \`ComponentNameInputs\`.
+- Use \`list-local-component-files\` and \`write-local-component-file\` for
+  component source changes when Content tools are available. Otherwise edit the
+  component files directly like normal repo source.
+
+## Boundaries
+
+- Moving, renaming, and reordering local-file pages are not first-class Content
+  UI operations yet. Use normal file operations when the user asks for those,
+  then let Content rediscover the file tree.
+- Do not push/pull Notion, Builder.io, or other provider-backed content unless
+  the user explicitly asks for provider sync.
+- Do not paste secrets, private provider data, or credential-looking values into
+  docs, generated pages, frontmatter, examples, or local components.
 `;
 
 const DESIGN_EXPLORATION_SKILL_MD = `---
@@ -272,14 +394,16 @@ sign-in at setup — this is intended), so the first tool call in that client do
 not hit an OAuth wall:
 
 \`\`\`bash
-npx @agent-native/core@latest skills add visual-plan
+npx @agent-native/core@latest skills add visual-plans
 \`\`\`
 
 After that, \`/visual-plan\` and \`/visual-recap\` are the two installed slash
-commands. The other planning modes (\`create-ui-plan\`, \`create-prototype-plan\`,
-\`create-plan-design\`, \`create-visual-questions\`) are MCP tools reachable from
-\`/visual-plan\`, not separate slash commands. Pass \`--no-connect\` to register
-the connector without authenticating, then run
+commands. If you only need one command, use \`skills add visual-plan\` or
+\`skills add visual-recap\` instead. The other planning modes
+(\`create-ui-plan\`, \`create-prototype-plan\`, \`create-plan-design\`,
+\`create-visual-questions\`) are MCP tools reachable from \`/visual-plan\`, not
+separate slash commands. Pass \`--no-connect\` to register the connector without
+authenticating, then run
 \`npx @agent-native/core@latest connect https://plan.agent-native.com --client all\`
 whenever you are ready, or choose a narrower \`--client\`. Auth and MCP tool
 loading are per client config/session.
@@ -288,7 +412,7 @@ loading are per client config/session.
 install with \`--mode local-files\`:
 
 \`\`\`bash
-npx @agent-native/core@latest skills add visual-plan --mode local-files
+npx @agent-native/core@latest skills add visual-plans --mode local-files
 \`\`\`
 
 This mode does not register the Plan MCP connector. Before authoring structured
@@ -402,6 +526,13 @@ themes. For any inline border, background, or text color, reference a token:
 and \`--wf-radius\`. Never hard-code a hex color and never set \`font-family\` — the
 renderer owns the sketch/clean font.
 
+**Use literal CSS lengths for spacing.** The \`--wf-*\` tokens are for colors and
+renderer-owned visual styling, not layout spacing. Do not use guessed spacing
+tokens such as \`var(--wf-space-4)\`, Tailwind spacing classes, or theme spacing
+variables inside wireframe HTML; if a token is unavailable in the Plan renderer,
+padding collapses and content hugs the border. Use explicit CSS lengths for
+layout: \`padding:16px\`, \`gap:12px\`, \`margin-top:18px\`, \`minmax(0,1fr)\`.
+
 **Lay out with inline \`style\` flex/grid.** You write the real layout —
 \`display:flex; flex-direction:column; gap:10px; padding:16px\` and so on — and the
 renderer never repositions anything. Compose the actual product: reproduce the
@@ -473,20 +604,34 @@ no labels or copy. The renderer drops borders, sketch, and color into the
 skeleton register automatically. Never escape to a \`custom-html\` document block
 to fake a loader.
 
-**Editing an existing mockup.** To change one element, text, or color in an
-existing html mockup, call \`update-visual-plan\`
-with \`contentPatches: [{ op: "patch-wireframe-html", blockId, edits: [{ find,
+**Editing an existing mockup.** In hosted mode, to change one element, text, or
+color in an existing html mockup, do not regenerate the frame — call
+\`update-visual-plan\` with
+\`contentPatches: [{ op: "patch-wireframe-html", blockId, edits: [{ find,
 replace }] }]\`. Each \`find\` is a unique snippet of the current html (read it
 first with \`get-visual-plan\`); set \`all: true\` on an edit to replace every
-occurrence. The result is re-sanitized.
+occurrence. The result is re-sanitized. In local-files privacy mode, do not call
+hosted Plan tools; edit the local MDX source directly and rerun the local
+check/serve or verify command for \`<plan-dir>\`.
 
 **Treat the wireframe border as part of the visible design.** Always wrap HTML
 wireframe content in a root container with real inner padding before drawing
 cards, fields, pills, labels, or controls. Use at least 14-16px of padding,
-\`box-sizing: border-box\`, \`height: 100%\`, and \`gap\` between child rows so the
-first row never sits flush against the screen border. Keep text away from
-borders: every container, field, button, menu item, and annotation needs enough
-padding and line-height to read cleanly in the rendered Plan view.
+\`box-sizing: border-box\`, \`height: 100%\`, and \`gap\` between child rows on the
+root node itself so the first row never sits flush against the screen border. Do
+not rely on padding on a nested page section as the first visible inset; the
+outermost element must create the breathing room. Keep text away from borders:
+every container, field, button, menu item, and annotation needs enough padding
+and line-height to read cleanly in the rendered Plan view.
+
+**For feature-cloud or abundance visuals, optimize the composition over line-by-line
+reading.** Some marketing/product sections need to feel like a large surface area
+of capability rather than a precise app workflow. In those cases, use one padded
+root with a short headline and a dense, aesthetic cloud of short feature labels,
+chips, rings, or columns. Vary scale and opacity with tokens, cluster by meaning,
+and let many labels be glanceable rather than individually essential. Do not
+force dozens of features into equal cards with long wrapped sentences; that
+usually creates a messy unreadable mockup.
 
 **Lay out children safely so they never collide.** Use HTML flex/grid with
 \`gap\`, \`min-width: 0\`, and sensible overflow. Avoid negative margins, absolute
@@ -649,6 +794,14 @@ frames. Connector labels must sit in open canvas space. If the label would touch
 or cross either artboard, remove the label and explain the transition with a
 nearby annotation instead. Before handoff, inspect the top canvas at default zoom
 and move any frame whose label, connector, or annotation crosses another frame.
+
+**Board-unit spacing defaults.** The canvas coordinate system uses approximately 2 board units per screen pixel. \`browser\` frames occupy roughly 700 × 600 board units; \`desktop\` frames roughly 900 × 700 board units. Apply these minimum x/y gaps when placing frames explicitly — any less and frames will touch or overlap:
+
+- x-gap between \`browser\` frames: **≥ 1100** (700-unit frame + 400-unit gutter)
+- x-gap between \`desktop\` frames: **≥ 1300** (900-unit frame + 400-unit gutter)
+- y-gap between rows of any surface: **≥ 1400** (includes frame height + section header + buffer)
+
+When in doubt, use larger values — the canvas auto-zooms to fit everything.
 
 **Canvas annotations are designer notes on the artboard.** When a top canvas is
 present, sprinkle Figma-style notes near the frames they explain: a short
@@ -1122,13 +1275,14 @@ surface.
   approach and options in the plan. Ask a clarifying question only when an
   ambiguity would change the design and you cannot resolve it from the code; use
   the host agent's normal ask-user-question flow and batch 2-4 high-leverage
-  questions before finalizing. Do not call \`create-visual-questions\` from
-  \`/visual-plan\`. Otherwise state the assumption explicitly and proceed, and
-  keep anything unresolved in the plan's single bottom \`question-form\` Open
-  Questions block. For complex plans, do a final open-question pass before
-  handoff: if a decision would affect architecture, scope, UX, data shape, or
-  rollout, either decide it in the plan with rationale or put it in that bottom
-  form with a recommended default.
+  questions before finalizing. Do not call \`create-visual-questions\` for
+  ordinary clarification or preflight; reserve it for the visual-intake mode when
+  the user explicitly asks for a visual intake questionnaire. Otherwise state the
+  assumption explicitly and proceed, and keep anything unresolved in the plan's
+  single bottom \`question-form\` Open Questions block. For complex plans, do a
+  final open-question pass before handoff: if a decision would affect
+  architecture, scope, UX, data shape, or rollout, either decide it in the plan
+  with rationale or put it in that bottom form with a recommended default.
 - **The plan is the approval gate.** After surfacing it, ask the user to review
   and approve before you write code, and name which files/areas the work touches.
   Presenting the plan and requesting sign-off is the approval step — do not ask a
@@ -1172,6 +1326,11 @@ load tools. Never reinstall from scratch just to fix auth. Publish once the tool
 is reachable. Local-files privacy mode (after Tool Guidance) is the exception.
 
 ## Core Workflow
+
+This section describes the default hosted Plan MCP workflow. If
+\`AGENT_NATIVE_PLANS_MODE=local-files\` is set, or the user asks for fully local
+files/no hosted Plan writes, use **Local-Files Privacy Mode** instead; carry
+forward only the code-research and plan-composition guidance here.
 
 1. Follow the host agent's normal planning flow: inspect the codebase, delegate
    wide exploration when useful, gather the info needed, and ask native
@@ -1219,11 +1378,13 @@ is reachable. Local-files privacy mode (after Tool Guidance) is the exception.
    backend, data, multi-file, or risky), also kick off the self-review pass in
    **Self-Review Before Handoff** while the user reads, instead of blocking the
    handoff on it.
-5. Call \`get-plan-feedback\` before editing, after review, after any long pause,
+5. For hosted plans, call \`get-plan-feedback\` before editing, after review,
+   after any long pause,
    and before the final response. Treat \`anchorDetails\`, resolver intent, recent
    review events, and any focused screenshots from browser handoff as the source
    of truth for exactly what changed and exactly what each comment points at.
-6. Apply changes with \`update-visual-plan\`, preferring targeted \`contentPatches\`.
+6. For hosted plans, apply changes with \`update-visual-plan\`, preferring
+   targeted \`contentPatches\`.
    Treat the top-level \`content\` payload as a full replacement, not a merge; do
    not send a partial \`content\` object to add a canvas or one block. If a full
    replacement is unavoidable, first read the complete plan source/content, carry
@@ -1231,8 +1392,8 @@ is reachable. Local-files privacy mode (after Tool Guidance) is the exception.
    afterward so the document body was not truncated. When the user wants
    source-control friendly edits, use \`patch-visual-plan-source\` against the MDX
    files instead of regenerating the plan.
-7. Export with \`export-visual-plan\` only when the user wants a shareable receipt
-   or repo-check-in artifacts.
+7. For hosted plans, export with \`export-visual-plan\` only when the user wants a
+   shareable receipt or repo-check-in artifacts.
 
 ## Self-Review Before Handoff
 
@@ -1428,11 +1589,12 @@ The local-files contract is:
   wants the artifact checked into the repo, or use a repo-ignored/temporary
   folder such as \`.agent-native/plans/<slug>/\` or \`/tmp/agent-native-plans/<slug>/\`
   when it should not be checked in. The folder contains \`plan.mdx\`, optional
-  \`canvas.mdx\`, optional \`prototype.mdx\`, and optional \`.plan-state.json\`.
-- Run \`npx @agent-native/core@latest plan local check --dir plans/<slug>\`
-  before serving, then run
-  \`npx @agent-native/core@latest plan local serve --dir plans/<slug> --kind plan --open\`.
-  Report the returned local bridge URL from stdout or \`plans/<slug>/.plan-url\`.
+  \`canvas.mdx\`, optional \`prototype.mdx\`, and optional \`.plan-state.json\`. Use
+  that exact chosen folder as \`<plan-dir>\` in every local CLI command below.
+- Run \`npx @agent-native/core@latest plan local check --dir <plan-dir>\` before
+  serving, then run
+  \`npx @agent-native/core@latest plan local serve --dir <plan-dir> --kind plan --open\`.
+  Report the returned local bridge URL from stdout or \`<plan-dir>/.plan-url\`.
   Treat \`.plan-url\` as a local token file and do not commit it. The URL opens
   the hosted Plan UI but reads from the localhost bridge on this machine, so it
   is not shareable across machines. On macOS, \`--open\` prefers Chromium browsers;
@@ -1441,7 +1603,7 @@ The local-files contract is:
   running locally with the same \`PLAN_LOCAL_DIR\`, the \`/local-plans/<slug>\` route
   is also valid.
 - For headless verification, run
-  \`npx @agent-native/core@latest plan local verify --dir plans/<slug> --kind plan\`.
+  \`npx @agent-native/core@latest plan local verify --dir <plan-dir> --kind plan\`.
   It starts the bridge, checks the private-network preflight and JSON payload,
   prints diagnostics, and exits. If the browser hangs on "Loading plan", fetch
   the \`bridgeUrl\` from the verify/serve JSON to read the concrete validation
@@ -1462,6 +1624,11 @@ for that stronger privacy boundary, the host agent/model must also be local or
 otherwise approved by the user.
 
 ## Interpreting comment anchors
+
+This section applies to hosted plans with \`get-plan-feedback\` /
+\`update-visual-plan\`. In local-files mode, do not call hosted feedback or update
+tools; interpret file/chat feedback directly, edit the MDX files, rerun the
+local bridge check/serve/verify command, and report the new local URL.
 
 \`get-plan-feedback\` returns rich anchors — read them before acting on any comment.
 
@@ -1509,14 +1676,16 @@ sign-in at setup — this is intended), so the first tool call in that client do
 not hit an OAuth wall:
 
 \`\`\`bash
-npx @agent-native/core@latest skills add visual-plan
+npx @agent-native/core@latest skills add visual-plans
 \`\`\`
 
 After that, \`/visual-plan\` and \`/visual-recap\` are the two installed slash
-commands. The other planning modes (\`create-ui-plan\`, \`create-prototype-plan\`,
-\`create-plan-design\`, \`create-visual-questions\`) are MCP tools reachable from
-\`/visual-plan\`, not separate slash commands. Pass \`--no-connect\` to register
-the connector without authenticating, then run
+commands. If you only need one command, use \`skills add visual-plan\` or
+\`skills add visual-recap\` instead. The other planning modes
+(\`create-ui-plan\`, \`create-prototype-plan\`, \`create-plan-design\`,
+\`create-visual-questions\`) are MCP tools reachable from \`/visual-plan\`, not
+separate slash commands. Pass \`--no-connect\` to register the connector without
+authenticating, then run
 \`npx @agent-native/core@latest connect https://plan.agent-native.com --client all\`
 whenever you are ready, or choose a narrower \`--client\`. Auth and MCP tool
 loading are per client config/session.
@@ -1586,8 +1755,9 @@ In local-files mode:
   \`npx @agent-native/core@latest plan blocks --out plan-blocks.md\` when the Plan
   MCP connector is not registered; it calls the public no-auth
   \`get-plan-blocks\` route and sends no recap content. If network access is
-  unavailable, use the bundled references and validate with
-  \`plan local check\` / \`plan local serve\`. For \`checklist\` and \`question-form\`,
+  unavailable, use the bundled references and validate the MDX with
+  \`plan local check\`; do not run \`plan local serve\` unless the hosted Plan UI is
+  reachable or a local Plan app is already running. For \`checklist\` and \`question-form\`,
   copy the catalog examples verbatim: checklist items need \`id\` and \`label\`;
   question-form questions need \`id\`, \`title\`, and \`mode\`; and each option needs
   \`id\` and \`label\`. \`plan local check\` validates these required fields against
@@ -1597,21 +1767,24 @@ In local-files mode:
   folder such as \`.agent-native/plans/<slug>/\` or \`/tmp/agent-native-plans/<slug>/\`
   when it should not be checked in. The folder contains \`plan.mdx\`, optional
   \`canvas.mdx\`, optional \`prototype.mdx\`, and optional \`.plan-state.json\`. Set
-  \`kind: "recap"\` and \`localOnly: true\` in frontmatter/state when authoring
-  the source.
-- Run \`npx @agent-native/core@latest plan local check --dir plans/<slug>\`
-  before serving, then run
-  \`npx @agent-native/core@latest plan local serve --dir plans/<slug> --kind recap --open\`.
-  Report the returned local bridge URL from stdout or \`plans/<slug>/.plan-url\`.
+  \`kind: "recap"\` and \`localOnly: true\` in frontmatter/state when authoring the
+  source. Use that exact chosen folder as \`<plan-dir>\` in every local CLI command
+  below.
+- Run \`npx @agent-native/core@latest plan local check --dir <plan-dir>\` before
+  any preview. When the hosted Plan UI is reachable, run
+  \`npx @agent-native/core@latest plan local serve --dir <plan-dir> --kind recap --open\`.
+  Report the returned local bridge URL from stdout or \`<plan-dir>/.plan-url\`.
   Treat \`.plan-url\` as a local token file and do not commit it. The URL opens
   the hosted Plan UI but reads from the localhost bridge on this machine, so it
   is not shareable across machines. On macOS, \`--open\` prefers Chromium browsers;
   if Safari opens, switch to Chrome/Chromium because Safari can block the hosted
   HTTPS page from fetching the HTTP localhost bridge. If the Plan app itself is
   running locally with the same \`PLAN_LOCAL_DIR\`, the \`/local-plans/<slug>\` route
-  is also valid.
+  is also valid. In a truly offline environment, hand off the local \`<plan-dir>\`
+  path after \`plan local check\` and note that interactive preview requires either
+  network access to the hosted Plan UI or a running local Plan app.
 - For headless verification, run
-  \`npx @agent-native/core@latest plan local verify --dir plans/<slug> --kind recap\`.
+  \`npx @agent-native/core@latest plan local verify --dir <plan-dir> --kind recap\`.
   It starts the bridge, checks the private-network preflight and JSON payload,
   prints diagnostics, and exits. If the browser hangs on "Loading plan", fetch
   the \`bridgeUrl\` from the verify/serve JSON to read the concrete validation
@@ -1622,7 +1795,9 @@ In local-files mode:
   \`set-resource-visibility\`, or any hosted Plan tool for that recap except the
   schema-only block catalog lookup above.
 - Treat review feedback as file or chat feedback: update the MDX files directly,
-  rerun the local bridge command, and summarize the new local bridge URL.
+  rerun \`plan local check\`, and rerun \`serve\` or \`verify\` only when that preview
+  path is available. Summarize the new local URL when one exists; otherwise
+  summarize the checked local folder path.
   Hosted comments, sharing, screenshots, usage attachment, and PR sticky comment
   publishing are unavailable until the user explicitly opts into publishing.
 
@@ -1838,10 +2013,10 @@ and re-import before reporting the link. A text-match screenshot is not enough;
 visually inspect the captured image. When no browser is available (for example
 a headless CI agent), state that in the recap handoff instead.
 
-## Top Canvas Recaps — read \`../visual-plans/references/canvas.md\`
+## Top Canvas Recaps — read \`../visual-plan/references/canvas.md\`
 
 When a recap includes a top canvas, storyboard, or flow view, READ
-\`../visual-plans/references/canvas.md\` before authoring \`canvas.mdx\`. Recap
+\`../visual-plan/references/canvas.md\` before authoring \`canvas.mdx\`. Recap
 canvas artboards must use the same HTML wireframe path as good document-body
 wireframes: \`<Screen surface="..." html={...} />\` with a semantic HTML fragment.
 Do not author fresh kit-tree children such as \`<FrameScreen>\`, \`<Card>\`,
@@ -1855,8 +2030,8 @@ assume it used the legacy kit path and replace it with an HTML screen.
 
 In local-files privacy mode, run \`plan local check\` first, then report the local
 bridge URL from
-\`npx @agent-native/core@latest plan local serve --dir plans/<slug> --kind recap --open\`
-or from \`plans/<slug>/.plan-url\`. It opens the hosted Plan UI but reads from the
+\`npx @agent-native/core@latest plan local serve --dir <plan-dir> --kind recap --open\`
+or from \`<plan-dir>/.plan-url\`. It opens the hosted Plan UI but reads from the
 localhost bridge on this machine, so it is not shareable across machines. If the
 Plan app itself is running locally with the same \`PLAN_LOCAL_DIR\`, the
 \`/local-plans/<slug>\` route is also valid. Do not invent a hosted database URL
@@ -2021,7 +2196,8 @@ installed as plain text and no MCP tools are registered after discovery, run
 \`npx @agent-native/core@latest plan blocks --out plan-blocks.md\` and read that
 file first. The CLI command calls the public no-auth \`get-plan-blocks\` route and
 sends no plan/recap content. If network access is unavailable, use the bundled
-references and validate with \`plan local check\` / \`plan local serve\`.
+references and validate with \`plan local check\`; run \`plan local serve\` only
+when the hosted Plan UI is reachable or a local Plan app is already running.
 
 The catalog returns the authoritative, always-current block vocabulary generated
 live from the app's own block registry — the same config the renderer and MDX
@@ -2129,14 +2305,17 @@ inferred (not extracted) as inferred in prose.
 
 ## Bidirectional Loop
 
-Because a recap is a real, editable plan, the same review loop as forward plans
-applies: a reviewer can annotate any block, and the coding agent reads
-\`get-plan-feedback\` to drive fixes back into the code — annotation → agent →
-diff, the same close-the-loop flow forward plans use. After a reviewer annotates
-a block, call \`get-plan-feedback\` to read the structured feedback, then either
-update the recap with \`create-visual-recap\` (passing the existing \`planId\` to
-replace it in place) or apply targeted changes with \`update-visual-plan\`. The
-loop is live and wired. The one thing not yet automatic is PR-comment-triggered
+In hosted mode, because a recap is a real, editable plan, the same review loop
+as forward plans applies: a reviewer can annotate any block, and the coding
+agent reads \`get-plan-feedback\` to drive fixes back into the code — annotation →
+agent → diff, the same close-the-loop flow forward plans use. After a reviewer
+annotates a block, call \`get-plan-feedback\` to read the structured feedback,
+then either update the recap with \`create-visual-recap\` (passing the existing
+\`planId\` to replace it in place) or apply targeted changes with
+\`update-visual-plan\`. The loop is live and wired. In local-files privacy mode,
+do not call those hosted tools; read review notes from chat or local files, edit
+\`<plan-dir>/*.mdx\` directly, and rerun \`plan local check\`, \`serve\`, or \`verify\`
+for \`<plan-dir>\`. The one thing not yet automatic is PR-comment-triggered
 re-runs: the GitHub Action creates an initial recap per PR, but it does not yet
 re-run automatically when new review feedback is posted in GitHub — that
 auto-re-run is the remaining fast-follow.
@@ -2201,6 +2380,55 @@ export const BUILT_IN_APP_SKILLS = {
       ],
     }),
     skillMarkdown: ASSETS_SKILL_MD,
+  },
+  content: {
+    skillName: "content",
+    manifest: normalizeAppSkillManifest({
+      schemaVersion: 1,
+      id: "content",
+      displayName: "Content",
+      description:
+        "Edit docs, blogs, resources, and MDX content through the Content app, including repo-backed Local File Mode.",
+      hosted: {
+        url: "https://content.agent-native.com",
+        mcpUrl: "https://content.agent-native.com/_agent-native/mcp",
+      },
+      mcp: { serverName: "agent-native-content" },
+      auth: {
+        mode: "oauth",
+        setup:
+          "Authenticate with the Content MCP connector in the host app. Local File Mode requires a local Content app, Agent Native Desktop, or trusted local bridge for filesystem access.",
+      },
+      surfaces: [
+        {
+          id: "content-documents",
+          action: "list-documents",
+          path: "/",
+        },
+        {
+          id: "content-local-files",
+          action: "share-local-file-document",
+          path: "/local-files",
+        },
+      ],
+      skills: [
+        {
+          path: "skills/content",
+          visibility: "exported",
+          exportAs: "content",
+        },
+      ],
+      hostAdapters: [
+        "codex-plugin",
+        "claude-marketplace",
+        "vercel-skills",
+        "plain-skill",
+        "claude-skill",
+        "chatgpt-mcp",
+        "generic-mcp",
+      ],
+    }),
+    skillMarkdown: CONTENT_SKILL_MD,
   },
   design: {
     skillName: "design-exploration",
@@ -2370,6 +2598,7 @@ export const BUILT_IN_APP_SKILLS = {
 >;
 
 type BuiltInAppSkillId = keyof typeof BUILT_IN_APP_SKILLS;
+type ModeAwareAppSkillId = "visual-plans" | "content";
 
 export const AGENT_NATIVE_SKILL_METADATA_FILE = "agent-native-skill.json";
 
@@ -2382,6 +2611,12 @@ const BUILT_IN_APP_SKILL_ALIASES = {
   "image-generation": "assets",
   "agent-native-assets": "assets",
   "agent-native-images": "assets",
+  content: "content",
+  docs: "content",
+  documents: "content",
+  "local-content": "content",
+  "content-local-files": "content",
+  "agent-native-content": "content",
   design: "design",
   "ui-design": "design",
   "ux-design": "design",
@@ -2410,6 +2645,13 @@ const BUILT_IN_APP_SKILL_ALIASES = {
 
 const BUILT_IN_APP_SKILL_DISPLAY_ALIASES = {
   assets: ["images", "image-generation", "agent-native-images"],
+  content: [
+    "docs",
+    "documents",
+    "local-content",
+    "content-local-files",
+    "agent-native-content",
+  ],
   design: [
     "design-exploration",
     "ux-exploration",
@@ -2529,9 +2771,9 @@ export interface ParsedSkillsArgs {
    */
   mcpUrl?: string;
   /**
-   * Storage/backend mode for the Plans skills. Hosted is the existing default;
-   * local-files installs instructions that default to DB-free MDX + local
-   * preview and skips MCP registration/auth.
+   * Storage/backend mode for app-backed skills that support install modes. The
+   * field name is kept for CLI/API compatibility with the original Plan-only
+   * implementation.
    */
   planMode?: PlanInstallMode;
   /**
@@ -2593,6 +2835,7 @@ export interface SkillsAddResult {
   githubActionPath?: string;
   githubActionExisted?: boolean;
   githubActionSuggestedCommand?: string;
+  localManifestPath?: string;
   planMode?: PlanInstallMode;
 }
 
@@ -2636,11 +2879,25 @@ interface SkillInstallState {
   managed: boolean;
 }
 
+interface ScaffoldGuidanceState {
+  kind: "workspace-core" | "standalone";
+  displayName: string;
+  templateName: "workspace-core" | "headless" | "default";
+  path: string;
+  sourcePath: string;
+  projectRoot: string;
+  workspaceRoot?: string;
+  sharedPackageDir?: string;
+  current: boolean;
+  skillCount: number;
+}
+
 interface SkillInstallTarget {
   id: string;
   displayName: string;
   loaded: LoadedAppSkillManifest;
   skillNames: string[];
+  modeAwareId?: ModeAwareAppSkillId;
   materializeInstructions(outDir: string): string;
   cleanup?: () => void;
 }
@@ -2781,6 +3038,19 @@ function isLocalOnlyBuiltInSkill(
   return Boolean(entry && "localOnly" in entry && entry.localOnly);
 }
 
+function targetSupportsInstallMode(
+  targetId: string | undefined,
+): targetId is ModeAwareAppSkillId {
+  return targetId === "visual-plans" || targetId === "content";
+}
+
+function localFilesModeSkipsMcp(
+  targetId: string | undefined,
+  mode: PlanInstallMode | undefined,
+): boolean {
+  return mode === "local-files" && targetSupportsInstallMode(targetId);
+}
+
 function builtInExtraSkills(
   entry: (typeof BUILT_IN_APP_SKILLS)[BuiltInAppSkillId],
 ): Record<string, string> {
@@ -2870,7 +3140,34 @@ for plans and recaps instead of assuming \`https://plan.agent-native.com\`.`;
   return "";
 }
 
-function applyPlanModeToSkillMarkdown(
+function contentModeInstructionBlock(input: {
+  mode: PlanInstallMode | undefined;
+  mcpUrl?: string;
+}): string {
+  if (input.mode === "local-files") {
+    return `## Installed Mode
+
+Default storage for this installation: Content Local File Mode. This repo should
+have an \`agent-native.json\` file with \`apps.content.mode: "local-files"\`;
+the installer writes one if missing and fills in default roots for \`docs/\`,
+\`blog/\`, \`content/\`, and \`resources/\`. Prefer Content document actions
+when a local Content app,
+Agent Native Desktop, or another trusted local bridge exposes them. If those
+tools are not currently available, edit the configured Markdown/MDX files and
+local components directly, preserving frontmatter, imports, JSX, and unknown MDX
+syntax. The hosted Content app cannot read private repo files by itself.`;
+  }
+  if (input.mode === "self-hosted") {
+    return `## Installed Mode
+
+Default storage for this installation: the configured self-hosted/custom Content
+app${input.mcpUrl ? ` at \`${input.mcpUrl}\`` : ""}. Use that Content MCP
+connector instead of assuming \`https://content.agent-native.com\`.`;
+  }
+  return "";
+}
+
+function applyInstallModeToSkillMarkdown(
   markdown: string,
   input: {
     appSkillId: BuiltInAppSkillId;
@@ -2878,11 +3175,18 @@ function applyPlanModeToSkillMarkdown(
     mcpUrl?: string;
   },
 ): string {
-  if (input.appSkillId !== "visual-plans") return markdown;
-  const block = planModeInstructionBlock({
-    mode: input.mode,
-    mcpUrl: input.mcpUrl,
-  });
+  let block = "";
+  if (input.appSkillId === "visual-plans") {
+    block = planModeInstructionBlock({
+      mode: input.mode,
+      mcpUrl: input.mcpUrl,
+    });
+  } else if (input.appSkillId === "content") {
+    block = contentModeInstructionBlock({
+      mode: input.mode,
+      mcpUrl: input.mcpUrl,
+    });
+  }
   return insertAfterFrontmatter(markdown, block);
 }
 
@@ -2892,7 +3196,7 @@ function skillFilesForBuiltIn(
 ): Record<string, SkillFolderBundle> {
   const entry = BUILT_IN_APP_SKILLS[appSkillId];
   const skills: Record<string, string> = {
-    [entry.skillName]: applyPlanModeToSkillMarkdown(entry.skillMarkdown, {
+    [entry.skillName]: applyInstallModeToSkillMarkdown(entry.skillMarkdown, {
       appSkillId,
       mode: options.planMode,
       mcpUrl: options.mcpUrl,
@@ -2902,7 +3206,7 @@ function skillFilesForBuiltIn(
   for (const [skillName, skillMarkdown] of Object.entries(
     builtInExtraSkills(entry),
   )) {
-    skills[skillName] = applyPlanModeToSkillMarkdown(skillMarkdown, {
+    skills[skillName] = applyInstallModeToSkillMarkdown(skillMarkdown, {
       appSkillId,
       mode: options.planMode,
       mcpUrl: options.mcpUrl,
@@ -2920,7 +3224,8 @@ function skillFilesForBuiltIn(
       displayName: entry.manifest.displayName,
       skillName,
       mcpUrl:
-        isLocalOnlyBuiltInSkill(entry) || options.planMode === "local-files"
+        isLocalOnlyBuiltInSkill(entry) ||
+        localFilesModeSkipsMcp(appSkillId, options.planMode)
           ? ""
           : (options.mcpUrl ?? entry.manifest.hosted.mcpUrl),
       files,
@@ -2970,6 +3275,109 @@ function writeSkillFolder(
     `${JSON.stringify(metadata, null, 2)}\n`,
     "utf-8",
   );
+}
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function defaultContentLocalFilesAppConfig(): Record<string, unknown> {
+  return {
+    mode: "local-files",
+    roots: [
+      {
+        name: "Docs",
+        path: "docs",
+        kind: "docs",
+        extensions: [".md", ".mdx"],
+      },
+      {
+        name: "Blog",
+        path: "blog",
+        kind: "blog",
+        extensions: [".md", ".mdx"],
+      },
+      {
+        name: "Content",
+        path: "content",
+        kind: "content",
+        extensions: [".md", ".mdx"],
+      },
+      {
+        name: "Resources",
+        path: "resources",
+        kind: "resources",
+        extensions: [".md", ".mdx"],
+      },
+    ],
+    components: "components",
+    extensions: "extensions",
+    hide: ["**/_*.md", "**/_*.mdx"],
+  };
+}
+
+function contentLocalFilesManifestPath(baseDir: string): string {
+  return path.join(baseDir, "agent-native.json");
+}
+
+function shouldWriteContentLocalFilesManifest(
+  targetId: string | undefined,
+  mode: PlanInstallMode | undefined,
+): boolean {
+  return targetId === "content" && mode === "local-files";
+}
+
+function mergeContentLocalFilesManifest(
+  existing: unknown,
+): Record<string, unknown> {
+  const manifest = isJsonRecord(existing) ? { ...existing } : {};
+  if (manifest.version === undefined) manifest.version = 1;
+
+  const apps = isJsonRecord(manifest.apps) ? { ...manifest.apps } : {};
+  const contentApp = isJsonRecord(apps.content) ? { ...apps.content } : {};
+  const defaults = defaultContentLocalFilesAppConfig();
+  contentApp.mode = "local-files";
+  if (!Array.isArray(contentApp.roots) || contentApp.roots.length === 0) {
+    contentApp.roots = defaults.roots;
+  }
+  if (contentApp.components === undefined) {
+    contentApp.components = defaults.components;
+  }
+  if (contentApp.extensions === undefined) {
+    contentApp.extensions = defaults.extensions;
+  }
+  if (!Array.isArray(contentApp.hide) || contentApp.hide.length === 0) {
+    contentApp.hide = defaults.hide;
+  }
+  apps.content = contentApp;
+  manifest.apps = apps;
+  return manifest;
+}
+
+function writeContentLocalFilesManifest(
+  baseDir: string,
+  options: { dryRun?: boolean } = {},
+): string {
+  const manifestPath = contentLocalFilesManifestPath(baseDir);
+  let existing: unknown = {};
+  if (fs.existsSync(manifestPath)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+    } catch (error: any) {
+      throw new Error(
+        `Could not parse ${manifestPath}: ${error?.message ?? error}`,
+      );
+    }
+  }
+  const manifest = mergeContentLocalFilesManifest(existing);
+  if (!options.dryRun) {
+    fs.writeFileSync(
+      manifestPath,
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      "utf-8",
+    );
+  }
+  return manifestPath;
 }
 
 /**
@@ -3231,7 +3639,368 @@ function skillSearchRoots(input: {
   });
 }
 
+const SCAFFOLD_GUIDANCE_TARGETS = new Set([
+  "scaffold",
+  "generated",
+  "generated-app",
+  "generated-workspace",
+  "workspace",
+  "workspace-core",
+  "framework-guidance",
+]);
+
+function isScaffoldGuidanceTarget(value: string | undefined): boolean {
+  if (!value) return false;
+  return SCAFFOLD_GUIDANCE_TARGETS.has(value.trim().toLowerCase());
+}
+
+function corePackageRootDir(): string {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(here, "../..");
+}
+
+function bundledScaffoldSkillsDir(
+  templateName: ScaffoldGuidanceState["templateName"],
+): string {
+  return path.join(
+    corePackageRootDir(),
+    "src",
+    "templates",
+    templateName,
+    ".agents",
+    "skills",
+  );
+}
+
+function readJsonRecord(file: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf-8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {}
+  return undefined;
+}
+
+function readPackageJson(dir: string): Record<string, unknown> | undefined {
+  return readJsonRecord(path.join(dir, "package.json"));
+}
+
+function packageName(pkg: Record<string, unknown> | undefined): string | null {
+  return typeof pkg?.name === "string" ? pkg.name : null;
+}
+
+function workspaceCorePackageName(
+  pkg: Record<string, unknown> | undefined,
+): string | null {
+  const agentNative = pkg?.["agent-native"];
+  if (
+    agentNative &&
+    typeof agentNative === "object" &&
+    !Array.isArray(agentNative) &&
+    typeof (agentNative as Record<string, unknown>).workspaceCore === "string"
+  ) {
+    return (agentNative as Record<string, string>).workspaceCore;
+  }
+  return null;
+}
+
+function hasAgentNativeCoreDependency(
+  pkg: Record<string, unknown> | undefined,
+): boolean {
+  for (const field of ["dependencies", "devDependencies", "peerDependencies"]) {
+    const deps = pkg?.[field];
+    if (
+      deps &&
+      typeof deps === "object" &&
+      !Array.isArray(deps) &&
+      "@agent-native/core" in deps
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findWorkspaceCorePackageDir(
+  workspaceRoot: string,
+  workspaceCoreName: string,
+): string | undefined {
+  const packagesDir = path.join(workspaceRoot, "packages");
+  if (!fs.existsSync(packagesDir)) return undefined;
+  for (const entry of fs.readdirSync(packagesDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(packagesDir, entry.name);
+    if (packageName(readPackageJson(candidate)) === workspaceCoreName) {
+      return candidate;
+    }
+  }
+  const fallback = path.join(workspaceRoot, "packages", "shared");
+  return fs.existsSync(path.join(fallback, "package.json"))
+    ? fallback
+    : undefined;
+}
+
+function findGeneratedWorkspace(startDir: string):
+  | {
+      workspaceRoot: string;
+      sharedPackageDir: string;
+    }
+  | undefined {
+  let current = path.resolve(startDir);
+  while (true) {
+    const pkg = readPackageJson(current);
+    const workspaceCoreName = workspaceCorePackageName(pkg);
+    if (workspaceCoreName && fs.existsSync(path.join(current, "apps"))) {
+      const sharedPackageDir = findWorkspaceCorePackageDir(
+        current,
+        workspaceCoreName,
+      );
+      if (sharedPackageDir) {
+        return { workspaceRoot: current, sharedPackageDir };
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return undefined;
+}
+
+function detectStandaloneScaffoldTemplate(
+  projectRoot: string,
+): "headless" | "default" | undefined {
+  const pkg = readPackageJson(projectRoot);
+  if (!hasAgentNativeCoreDependency(pkg)) return undefined;
+  if (!fs.existsSync(path.join(projectRoot, ".agents", "skills"))) {
+    return undefined;
+  }
+
+  const hasAppDir = fs.existsSync(path.join(projectRoot, "app"));
+  const hasHeadlessHello = fs.existsSync(
+    path.join(projectRoot, "actions", "hello.ts"),
+  );
+  if (!hasAppDir && hasHeadlessHello) return "headless";
+
+  const looksLikeDefaultTemplate =
+    fs.existsSync(path.join(projectRoot, "app", "routes", "database.tsx")) &&
+    fs.existsSync(path.join(projectRoot, "app", "routes", "_index.tsx")) &&
+    fs.existsSync(path.join(projectRoot, "actions", "view-screen.ts"));
+  return looksLikeDefaultTemplate ? "default" : undefined;
+}
+
+function listImmediateSkillDirs(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function skillDirContentsMatch(sourceDir: string, targetDir: string): boolean {
+  const expected = listSkillFolderFiles(sourceDir);
+  const actual = listSkillFolderFiles(targetDir);
+  const expectedFiles = Object.keys(expected).sort();
+  const actualFiles = Object.keys(actual).sort();
+  if (expectedFiles.length !== actualFiles.length) return false;
+  for (let i = 0; i < expectedFiles.length; i += 1) {
+    if (expectedFiles[i] !== actualFiles[i]) return false;
+  }
+  return expectedFiles.every((file) => expected[file] === actual[file]);
+}
+
+function scaffoldGuidanceCurrent(
+  sourceRoot: string,
+  targetRoot: string,
+): boolean {
+  const skills = listImmediateSkillDirs(sourceRoot);
+  if (skills.length === 0) return false;
+  return skills.every((skill) =>
+    skillDirContentsMatch(
+      path.join(sourceRoot, skill),
+      path.join(targetRoot, skill),
+    ),
+  );
+}
+
+function collectScaffoldGuidanceStates(
+  parsed: ParsedSkillsArgs,
+  options: RunSkillsOptions,
+): ScaffoldGuidanceState[] {
+  if (parsed.target && !isScaffoldGuidanceTarget(parsed.target)) return [];
+  if (parsed.scopeExplicit && parsed.scope !== "project") return [];
+
+  const baseDir = path.resolve(options.baseDir ?? process.cwd());
+  const workspace = findGeneratedWorkspace(baseDir);
+  if (workspace) {
+    const sourcePath = bundledScaffoldSkillsDir("workspace-core");
+    const targetPath = path.join(
+      workspace.sharedPackageDir,
+      ".agents",
+      "skills",
+    );
+    if (!fs.existsSync(sourcePath)) return [];
+    return [
+      {
+        kind: "workspace-core",
+        displayName: "Generated workspace framework skills",
+        templateName: "workspace-core",
+        path: targetPath,
+        sourcePath,
+        projectRoot: workspace.workspaceRoot,
+        workspaceRoot: workspace.workspaceRoot,
+        sharedPackageDir: workspace.sharedPackageDir,
+        current: scaffoldGuidanceCurrent(sourcePath, targetPath),
+        skillCount: listImmediateSkillDirs(sourcePath).length,
+      },
+    ];
+  }
+
+  const templateName = detectStandaloneScaffoldTemplate(baseDir);
+  if (!templateName) return [];
+  const sourcePath = bundledScaffoldSkillsDir(templateName);
+  const targetPath = path.join(baseDir, ".agents", "skills");
+  if (!fs.existsSync(sourcePath)) return [];
+  return [
+    {
+      kind: "standalone",
+      displayName: `Generated ${templateName} app framework skills`,
+      templateName,
+      path: targetPath,
+      sourcePath,
+      projectRoot: baseDir,
+      current: scaffoldGuidanceCurrent(sourcePath, targetPath),
+      skillCount: listImmediateSkillDirs(sourcePath).length,
+    },
+  ];
+}
+
+function copyScaffoldGuidanceSkills(
+  sourceRoot: string,
+  targetRoot: string,
+): void {
+  fs.mkdirSync(targetRoot, { recursive: true });
+  for (const skill of listImmediateSkillDirs(sourceRoot)) {
+    const targetSkillDir = path.join(targetRoot, skill);
+    if (
+      fs.existsSync(targetSkillDir) &&
+      fs.lstatSync(targetSkillDir).isSymbolicLink()
+    ) {
+      continue;
+    }
+    fs.rmSync(targetSkillDir, { recursive: true, force: true });
+    fs.cpSync(path.join(sourceRoot, skill), targetSkillDir, {
+      recursive: true,
+    });
+  }
+}
+
+function updateScaffoldGuidanceStates(
+  states: ScaffoldGuidanceState[],
+  dryRun: boolean,
+): ScaffoldGuidanceState[] {
+  const updated: ScaffoldGuidanceState[] = [];
+  for (const state of states) {
+    if (state.current) continue;
+    if (!dryRun) {
+      copyScaffoldGuidanceSkills(state.sourcePath, state.path);
+    }
+    updated.push({
+      ...state,
+      current: !dryRun,
+    });
+  }
+  return updated;
+}
+
+function ensureWorkspaceRootSkillsLink(
+  workspaceRoot: string,
+  sharedPackageDir: string,
+): void {
+  const sharedSkillsDir = path.join(sharedPackageDir, ".agents", "skills");
+  if (!fs.existsSync(sharedSkillsDir)) return;
+
+  const agentsDir = path.join(workspaceRoot, ".agents");
+  const linkPath = path.join(agentsDir, "skills");
+  const target = path.relative(agentsDir, sharedSkillsDir);
+
+  fs.mkdirSync(agentsDir, { recursive: true });
+  try {
+    const stat = fs.lstatSync(linkPath);
+    if (stat.isSymbolicLink()) {
+      if (fs.readlinkSync(linkPath) === target) return;
+      fs.unlinkSync(linkPath);
+    } else {
+      copyScaffoldGuidanceSkills(sharedSkillsDir, linkPath);
+      return;
+    }
+  } catch {}
+
+  try {
+    fs.symlinkSync(
+      target,
+      linkPath,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch {
+    try {
+      fs.cpSync(sharedSkillsDir, linkPath, { recursive: true });
+    } catch {}
+  }
+}
+
+function refreshCopiedClaudeSkills(projectRoot: string): void {
+  const agentsSkillsDir = path.join(projectRoot, ".agents", "skills");
+  const claudeSkillsDir = path.join(projectRoot, ".claude", "skills");
+  if (!fs.existsSync(agentsSkillsDir) || !fs.existsSync(claudeSkillsDir)) {
+    return;
+  }
+  try {
+    if (fs.lstatSync(claudeSkillsDir).isSymbolicLink()) return;
+    copyScaffoldGuidanceSkills(agentsSkillsDir, claudeSkillsDir);
+  } catch {}
+}
+
+function repairScaffoldAgentLinks(states: ScaffoldGuidanceState[]): void {
+  const seen = new Set<string>();
+  for (const state of states) {
+    if (state.workspaceRoot && state.sharedPackageDir) {
+      const key = `workspace:${state.workspaceRoot}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      ensureWorkspaceRootSkillsLink(
+        state.workspaceRoot,
+        state.sharedPackageDir,
+      );
+      setupAgentSymlinks(state.workspaceRoot);
+      refreshCopiedClaudeSkills(state.workspaceRoot);
+      setupAgentSymlinks(state.sharedPackageDir);
+      refreshCopiedClaudeSkills(state.sharedPackageDir);
+      const appsDir = path.join(state.workspaceRoot, "apps");
+      if (fs.existsSync(appsDir)) {
+        for (const entry of fs.readdirSync(appsDir, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const appDir = path.join(appsDir, entry.name);
+          if (fs.existsSync(path.join(appDir, "package.json"))) {
+            setupAgentSymlinks(appDir);
+            refreshCopiedClaudeSkills(appDir);
+          }
+        }
+      }
+      continue;
+    }
+
+    const key = `standalone:${state.projectRoot}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    setupAgentSymlinks(state.projectRoot);
+    refreshCopiedClaudeSkills(state.projectRoot);
+  }
+}
+
 function targetIdsForStatus(parsed: ParsedSkillsArgs): BuiltInAppSkillId[] {
+  if (isScaffoldGuidanceTarget(parsed.target)) return [];
   if (!parsed.target) {
     return (Object.keys(BUILT_IN_APP_SKILLS) as BuiltInAppSkillId[]).filter(
       (id) => !isLocalOnlyBuiltInSkill(BUILT_IN_APP_SKILLS[id]),
@@ -3468,6 +4237,11 @@ const BUILT_IN_SKILL_PROMPT_OPTIONS: SkillsTargetPromptContext["options"] = [
     hint: BUILT_IN_APP_SKILLS.assets.manifest.description,
   },
   {
+    value: "content",
+    label: "content",
+    hint: BUILT_IN_APP_SKILLS.content.manifest.description,
+  },
+  {
     value: "design-exploration",
     label: "design-exploration",
     hint: BUILT_IN_APP_SKILLS.design.manifest.description,
@@ -3668,8 +4442,8 @@ async function promptForPlanMode(
     options: [
       {
         value: "hosted",
-        label: "Hosted plans, shareable links",
-        hint: "Recommended. 100% free and open source. Stores plans at plan.agent-native.com with sharing, comments, and browser editor. Requires one-time browser sign-in.",
+        label: "Hosted plans, shareable links (recommended)",
+        hint: "100% free and open source. Supports comments, browser editor, and sharing. Requires one-time browser sign-in.",
       },
       {
         value: "local-files",
@@ -3815,6 +4589,14 @@ function targetsIncludePlans(targets: string[]): boolean {
   return targets.some(targetIncludesPlans);
 }
 
+function targetIncludesInstallModeSkill(target: string): boolean {
+  return targetSupportsInstallMode(normalizeKnownSkillTarget(target));
+}
+
+function targetsIncludeInstallModeSkills(targets: string[]): boolean {
+  return targets.some(targetIncludesInstallModeSkill);
+}
+
 function planSkillNamesSelected(skillNames: string[] | undefined): boolean {
   return Boolean(
     skillNames?.some(
@@ -3823,11 +4605,24 @@ function planSkillNamesSelected(skillNames: string[] | undefined): boolean {
   );
 }
 
+function installModeSkillNamesSelected(
+  skillNames: string[] | undefined,
+): boolean {
+  return Boolean(
+    skillNames?.some((name) =>
+      targetSupportsInstallMode(normalizeKnownSkillTarget(name)),
+    ),
+  );
+}
+
 function shouldForwardPlanModeFlag(
   target: string,
   skillNames: string[] | undefined,
 ): boolean {
-  return targetIncludesPlans(target) || planSkillNamesSelected(skillNames);
+  return (
+    targetIncludesInstallModeSkill(target) ||
+    installModeSkillNamesSelected(skillNames)
+  );
 }
 
 function recapSkillNamesSelected(skillNames: string[] | undefined): boolean {
@@ -4051,6 +4846,9 @@ function loadSkillTarget(
         dir: process.cwd(),
       },
       skillNames,
+      modeAwareId: targetSupportsInstallMode(knownTarget)
+        ? knownTarget
+        : undefined,
       materializeInstructions(outDir) {
         const bundles = skillFilesForBuiltIn(knownTarget);
         for (const bundle of Object.values(bundles)) {
@@ -4082,6 +4880,9 @@ function loadSkillTarget(
           skill.visibility === "exported" || skill.visibility === "both",
       )
       .map((skill) => skill.exportAs ?? path.basename(skill.path)),
+    modeAwareId: targetSupportsInstallMode(loaded.manifest.id)
+      ? loaded.manifest.id
+      : undefined,
     materializeInstructions(outDir) {
       const packed = buildAppSkillPack(loaded, outDir);
       const vercelAdapter = path.join(
@@ -4156,6 +4957,7 @@ function preserveMcpUrlAppPathOverride(
 function dryRunInstallCommand(
   parsed: ParsedSkillsArgs,
   target: string,
+  options: { modeAwareTargetId?: string } = {},
 ): string {
   const clients =
     parsed.clients ??
@@ -4174,7 +4976,9 @@ function dryRunInstallCommand(
     target,
     parsed.plainSkillNames,
   );
-  if (forwardsPlanFlags && parsed.planMode)
+  const forwardsInstallMode =
+    forwardsPlanFlags || targetSupportsInstallMode(options.modeAwareTargetId);
+  if (forwardsInstallMode && parsed.planMode)
     args.push("--mode", parsed.planMode);
   if (parsed.mcpUrl) args.push("--mcp-url", parsed.mcpUrl);
   if (parsed.instructions && !parsed.mcp) args.push("--instructions-only");
@@ -4356,7 +5160,7 @@ async function addPlainSkillRepo(
       "Plain skill repositories only install skill instructions. Run without --mcp-only.",
     );
   }
-  if (parsed.mcpUrl && !planSkillNamesSelected(parsed.plainSkillNames)) {
+  if (parsed.mcpUrl && !installModeSkillNamesSelected(parsed.plainSkillNames)) {
     throw new Error(
       "--mcp-url only applies to app-backed Agent Native skills.",
     );
@@ -4584,22 +5388,6 @@ export async function addAgentNativeSkill(
     );
   }
   const knownTarget = normalizeKnownSkillTarget(target);
-  const planMode =
-    knownTarget === "visual-plans"
-      ? (parsed.planMode ?? (parsed.mcpUrl ? "self-hosted" : "hosted"))
-      : undefined;
-  if (parsed.planMode && knownTarget !== "visual-plans") {
-    throw new Error("--mode only applies to visual-plan / visual-recap.");
-  }
-  if (planMode === "local-files" && parsed.mcpUrl) {
-    throw new Error("--mode local-files cannot be combined with --mcp-url.");
-  }
-  if (planMode === "self-hosted" && !parsed.mcpUrl) {
-    throw new Error("--mode self-hosted requires --mcp-url <url>.");
-  }
-  const shouldRegisterMcp =
-    parsed.mcp &&
-    !(knownTarget === "visual-plans" && planMode === "local-files");
   // For multi-skill bundles (the plan bundle), a single-skill target installs
   // only that skill. `installsRecap` controls the PR Visual Recap github-action
   // offer, which is only relevant when the recap skill is part of the install.
@@ -4618,7 +5406,13 @@ export async function addAgentNativeSkill(
     );
   }
   const knownBuiltIn = knownTarget ? BUILT_IN_APP_SKILLS[knownTarget] : null;
+  const baseDir = options.baseDir ?? process.cwd();
   if (isLocalOnlyBuiltInSkill(knownBuiltIn)) {
+    if (parsed.planMode) {
+      throw new Error(
+        "--mode only applies to visual-plan / visual-recap / content.",
+      );
+    }
     if (parsed.mcpUrl) {
       throw new Error(
         "Context X-Ray is installed locally and does not use --mcp-url yet.",
@@ -4658,7 +5452,7 @@ export async function addAgentNativeSkill(
       };
     }
     const localInstall = installLocalContextXray({
-      baseDir: options.baseDir ?? process.cwd(),
+      baseDir,
       clients,
       scope: parsed.scope,
     });
@@ -4684,6 +5478,28 @@ export async function addAgentNativeSkill(
     };
   }
   let installTarget = loadSkillTarget(target, onlySkillNames);
+  const modeAwareTargetId = installTarget.modeAwareId;
+  const planMode = modeAwareTargetId
+    ? (parsed.planMode ??
+      (parsed.mcpUrl
+        ? "self-hosted"
+        : modeAwareTargetId === "visual-plans"
+          ? "hosted"
+          : undefined))
+    : undefined;
+  if (parsed.planMode && !modeAwareTargetId) {
+    throw new Error(
+      "--mode only applies to visual-plan / visual-recap / content.",
+    );
+  }
+  if (planMode === "local-files" && parsed.mcpUrl) {
+    throw new Error("--mode local-files cannot be combined with --mcp-url.");
+  }
+  if (planMode === "self-hosted" && !parsed.mcpUrl) {
+    throw new Error("--mode self-hosted requires --mcp-url <url>.");
+  }
+  const shouldRegisterMcp =
+    parsed.mcp && !localFilesModeSkipsMcp(modeAwareTargetId, planMode);
   if (parsed.mcpUrl) {
     installTarget = withMcpUrlOverride(installTarget, parsed.mcpUrl);
   }
@@ -4699,6 +5515,12 @@ export async function addAgentNativeSkill(
   const skillsAgents = skillsAgentsForClients(clients);
   if (parsed.dryRun) {
     try {
+      const localManifestPath = shouldWriteContentLocalFilesManifest(
+        modeAwareTargetId,
+        planMode,
+      )
+        ? contentLocalFilesManifestPath(baseDir)
+        : undefined;
       const githubActionPath =
         parsed.withGithubAction && installsRecap
           ? prVisualRecapWorkflowDisplayPath()
@@ -4718,16 +5540,19 @@ export async function addAgentNativeSkill(
         displayName: installTarget.displayName,
         skillNames: installTarget.skillNames,
         skillsAgents,
-        mcpUrl:
-          knownTarget === "visual-plans" && planMode === "local-files"
-            ? ""
-            : installTarget.loaded.manifest.hosted.mcpUrl,
+        mcpUrl: localFilesModeSkipsMcp(modeAwareTargetId, planMode)
+          ? ""
+          : installTarget.loaded.manifest.hosted.mcpUrl,
         mcpClients: shouldRegisterMcp ? mcpClients : [],
         dryRun: true,
-        commands: [dryRunInstallCommand(parsed, target)],
+        commands: [
+          dryRunInstallCommand(parsed, target, { modeAwareTargetId }),
+          ...(localManifestPath ? [`write ${localManifestPath}`] : []),
+        ],
         githubActionPath,
         githubActionSuggestedCommand,
         planMode,
+        localManifestPath,
       };
     } finally {
       installTarget.cleanup?.();
@@ -4740,6 +5565,7 @@ export async function addAgentNativeSkill(
   let connected = false;
   let connectCommand: string | undefined;
   let registeredMcpClients: ClientId[] = shouldRegisterMcp ? mcpClients : [];
+  let localManifestPath: string | undefined;
 
   try {
     if (parsed.instructions) {
@@ -4759,7 +5585,7 @@ export async function addAgentNativeSkill(
           onlySkillNames,
           skillsAgents,
           scope: parsed.scope as "project" | "user",
-          baseDir: options.baseDir ?? process.cwd(),
+          baseDir,
           dryRun: parsed.dryRun,
           planMode,
           mcpUrl: installTarget.loaded.manifest.hosted.mcpUrl,
@@ -4781,6 +5607,12 @@ export async function addAgentNativeSkill(
           ...installTarget.skillNames.flatMap((skill) => ["--skill", skill]),
           ...skillsAgents.flatMap((agent) => ["-a", agent]),
           ...(parsed.scope === "user" ? ["-g"] : []),
+          ...(modeAwareTargetId && parsed.planMode
+            ? ["--mode", parsed.planMode]
+            : []),
+          ...(modeAwareTargetId && parsed.mcpUrl
+            ? ["--mcp-url", parsed.mcpUrl]
+            : []),
           ...(parsed.yes || knownTarget ? ["-y"] : []),
         ];
         commands.push(commandString("npx", args));
@@ -4794,6 +5626,11 @@ export async function addAgentNativeSkill(
             );
         }
       }
+    }
+
+    if (shouldWriteContentLocalFilesManifest(modeAwareTargetId, planMode)) {
+      localManifestPath = writeContentLocalFilesManifest(baseDir);
+      commands.push(`write ${localManifestPath}`);
     }
 
     // Skill instructions are now on disk (built-in folders copied or external
@@ -4858,7 +5695,6 @@ export async function addAgentNativeSkill(
 
     // `--with-github-action`: also drop the PR Visual Recap workflow into the
     // repo so PRs get automatic recaps. Only meaningful for the plan family.
-    const baseDir = options.baseDir ?? process.cwd();
     let withGithubAction = Boolean(parsed.withGithubAction);
     let githubActionPath: string | undefined;
     let githubActionExisted: boolean | undefined;
@@ -4916,10 +5752,9 @@ export async function addAgentNativeSkill(
       instructionSource,
       skillNames: installTarget.skillNames,
       skillsAgents,
-      mcpUrl:
-        knownTarget === "visual-plans" && planMode === "local-files"
-          ? ""
-          : installTarget.loaded.manifest.hosted.mcpUrl,
+      mcpUrl: localFilesModeSkipsMcp(modeAwareTargetId, planMode)
+        ? ""
+        : installTarget.loaded.manifest.hosted.mcpUrl,
       mcpClients: registeredMcpClients,
       dryRun: parsed.dryRun,
       commands,
@@ -4927,6 +5762,7 @@ export async function addAgentNativeSkill(
       connected,
       connectCommand,
       planMode,
+      localManifestPath,
       githubActionPath,
       githubActionExisted,
       githubActionSuggestedCommand,
@@ -4996,10 +5832,32 @@ function formatSkillState(state: SkillInstallState): string {
   return `${state.skillName.padEnd(22)} ${status.padEnd(7)} ${state.scope}/${state.client} ${managed}${hashes}\n  ${state.path}`;
 }
 
+function scaffoldStateJson(state: ScaffoldGuidanceState) {
+  return {
+    kind: state.kind,
+    displayName: state.displayName,
+    templateName: state.templateName,
+    path: state.path,
+    sourcePath: state.sourcePath,
+    projectRoot: state.projectRoot,
+    workspaceRoot: state.workspaceRoot,
+    sharedPackageDir: state.sharedPackageDir,
+    skillCount: state.skillCount,
+    status: state.current ? "current" : "stale",
+    managed: true,
+  };
+}
+
+function formatScaffoldState(state: ScaffoldGuidanceState): string {
+  const status = state.current ? "current" : "stale";
+  return `${"scaffold".padEnd(22)} ${status.padEnd(7)} project/${state.kind} managed (${state.skillCount} skills)\n  ${state.path}`;
+}
+
 function planModeSummary(mode: PlanInstallMode): string {
-  if (mode === "local-files") return "Local files - No sharing, all local.";
-  if (mode === "self-hosted") return "Self-hosted/custom Plan app";
-  return "Hosted Plans - shareable links and comments";
+  if (mode === "local-files")
+    return "Local files - no hosted writes by default";
+  if (mode === "self-hosted") return "Self-hosted/custom app";
+  return "Hosted app";
 }
 
 function skillInstructionAgentLabel(agent: string): string {
@@ -5017,7 +5875,7 @@ function targetInstallsMcp(
   if (!parsed.mcp) return false;
   if (publicSkillSelectionNames(target)) return false;
   const knownTarget = normalizeKnownSkillTarget(target);
-  if (knownTarget === "visual-plans") return parsed.planMode !== "local-files";
+  if (localFilesModeSkipsMcp(knownTarget, parsed.planMode)) return false;
   if (knownTarget) {
     return !isLocalOnlyBuiltInSkill(BUILT_IN_APP_SKILLS[knownTarget]);
   }
@@ -5075,25 +5933,46 @@ function runSkillsStatusOrUpdate(
   options: RunSkillsOptions,
   update: boolean,
 ): void {
-  const before = collectSkillInstallStates(parsed, options);
-  const changed = update ? updateSkillInstallStates(before, parsed.dryRun) : [];
-  const after =
+  const skillBefore = collectSkillInstallStates(parsed, options);
+  const scaffoldBefore = collectScaffoldGuidanceStates(parsed, options);
+  const skillChanged = update
+    ? updateSkillInstallStates(skillBefore, parsed.dryRun)
+    : [];
+  const scaffoldChanged = update
+    ? updateScaffoldGuidanceStates(scaffoldBefore, parsed.dryRun)
+    : [];
+  if (update && !parsed.dryRun && scaffoldChanged.length > 0) {
+    repairScaffoldAgentLinks(scaffoldChanged);
+  }
+  const skillAfter =
     update && !parsed.dryRun
       ? collectSkillInstallStates(parsed, options)
-      : before;
+      : skillBefore;
+  const scaffoldAfter =
+    update && !parsed.dryRun
+      ? collectScaffoldGuidanceStates(parsed, options)
+      : scaffoldBefore;
+  const beforeCount = skillBefore.length + scaffoldBefore.length;
+  const changedCount = skillChanged.length + scaffoldChanged.length;
 
   if (parsed.printJson) {
-    const outputStates = update && !parsed.dryRun ? after : before;
+    const outputSkillStates =
+      update && !parsed.dryRun ? skillAfter : skillBefore;
+    const outputScaffoldStates =
+      update && !parsed.dryRun ? scaffoldAfter : scaffoldBefore;
     process.stdout.write(
       `${JSON.stringify(
         {
           ok: true,
           command: parsed.command,
           dryRun: parsed.dryRun,
-          found: before.length,
-          stale: outputStates.filter((state) => !state.current).length,
-          updated: changed.length,
-          skills: outputStates.map(skillStateJson),
+          found: beforeCount,
+          stale:
+            outputSkillStates.filter((state) => !state.current).length +
+            outputScaffoldStates.filter((state) => !state.current).length,
+          updated: changedCount,
+          skills: outputSkillStates.map(skillStateJson),
+          scaffold: outputScaffoldStates.map(scaffoldStateJson),
         },
         null,
         2,
@@ -5102,10 +5981,13 @@ function runSkillsStatusOrUpdate(
     return;
   }
 
-  if (before.length === 0) {
+  if (beforeCount === 0) {
     const target = parsed.target ? ` for ${parsed.target}` : "";
+    const hint = isScaffoldGuidanceTarget(parsed.target)
+      ? `Run this from a generated Agent Native app or workspace root.\n`
+      : `Run "npx @agent-native/core@latest skills add ${parsed.target ?? "visual-plan"}" to install one.\n`;
     process.stdout.write(
-      `No installed Agent Native skill copies found${target}.\nRun "npx @agent-native/core@latest skills add ${parsed.target ?? "visual-plan"}" to install one.\n`,
+      `No installed Agent Native skill copies found${target}.\n${hint}`,
     );
     return;
   }
@@ -5113,20 +5995,27 @@ function runSkillsStatusOrUpdate(
   if (update) {
     if (parsed.dryRun) {
       process.stdout.write(
-        changed.length
-          ? `Would update ${changed.length} skill folder${changed.length === 1 ? "" : "s"}:\n`
+        changedCount
+          ? `Would update ${changedCount} skill folder${changedCount === 1 ? "" : "s"}:\n`
           : "All discovered skill folders are already current.\n",
       );
     } else {
       process.stdout.write(
-        changed.length
-          ? `Updated ${changed.length} skill folder${changed.length === 1 ? "" : "s"}.\n`
+        changedCount
+          ? `Updated ${changedCount} skill folder${changedCount === 1 ? "" : "s"}.\n`
           : "All discovered skill folders are already current.\n",
       );
     }
   }
 
-  const rows = (update && parsed.dryRun ? before : after).map(formatSkillState);
+  const rows = [
+    ...(update && parsed.dryRun ? skillBefore : skillAfter).map(
+      formatSkillState,
+    ),
+    ...(update && parsed.dryRun ? scaffoldBefore : scaffoldAfter).map(
+      formatScaffoldState,
+    ),
+  ];
   process.stdout.write(`${rows.join("\n")}\n`);
 }
 
@@ -5255,8 +6144,13 @@ export async function runSkills(
     const includesPlans =
       targetsIncludePlans(targets) ||
       planSkillNamesSelected(parsed.plainSkillNames);
-    if (parsed.planMode && !includesPlans) {
-      throw new Error("--mode only applies to visual-plan / visual-recap.");
+    const includesInstallModeSkills =
+      targetsIncludeInstallModeSkills(targets) ||
+      installModeSkillNamesSelected(parsed.plainSkillNames);
+    if (parsed.planMode && !includesInstallModeSkills) {
+      throw new Error(
+        "--mode only applies to visual-plan / visual-recap / content.",
+      );
     }
     if (includesPlans) {
       if (!parsed.planMode && parsed.mcpUrl) {
@@ -5491,7 +6385,7 @@ export async function runSkills(
         : "MCP config           not required",
       mcpUrls.length ? `MCP URL              ${mcpUrls.join(", ")}` : "",
       planModes.length
-        ? `Plan mode            ${planModes.map(planModeSummary).join(", ")}`
+        ? `Install mode         ${planModes.map(planModeSummary).join(", ")}`
         : "",
       authConnected
         ? "Authentication       completed"

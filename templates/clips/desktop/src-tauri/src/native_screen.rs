@@ -13,6 +13,8 @@ use core_graphics::display::{CGDisplay, CGPoint};
 #[cfg(target_os = "macos")]
 use screencapturekit::audio_devices::AudioInputDevice;
 #[cfg(target_os = "macos")]
+use screencapturekit::cg::CGRect;
+#[cfg(target_os = "macos")]
 use screencapturekit::recording_output::{
     SCRecordingOutput, SCRecordingOutputCodec, SCRecordingOutputConfiguration,
     SCRecordingOutputDelegate, SCRecordingOutputFileType,
@@ -24,7 +26,6 @@ use screencapturekit::stream::{
     configuration::SCStreamConfiguration, content_filter::SCContentFilter,
     output_type::SCStreamOutputType, sc_stream::SCStream,
 };
-#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const QUICKTIME_RECORDING_MIME_TYPE: &str = "video/quicktime";
@@ -36,14 +37,37 @@ const COMPRESSION_ENABLED: bool = true;
 const TRANSCODE_THRESHOLD_BYTES: u64 = 24 * 1024 * 1024;
 const TARGET_UPLOAD_BYTES: u64 = 18 * 1024 * 1024;
 // Mirror of the shared `MAX_UPLOAD_BYTES` limit (see
-// `templates/clips/shared/upload-limits.ts`). Same default (256 MB) and same
+// `templates/clips/shared/upload-limits.ts`). Same default (2 GB) and same
 // env var (CLIPS_MAX_UPLOAD_BYTES) so desktop and web stay in lockstep.
-const DEFAULT_MAX_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MIN_TRANSCODE_VIDEO_RATE_KBPS: u32 = 350;
 const TRANSCODE_RATE_LIMIT_OVERHEAD_KBPS: f64 = 64.0;
 const TRANSCODE_FRAME_RATE_LIMIT: u32 = 30;
 const NORMALIZED_AUDIO_BITRATE_KBPS: u32 = 160;
 const AUDIO_LOUDNESS_FILTER: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
+// When the mic is captured alongside system audio, ScreenCaptureKit lays the
+// two sources out as the left/right channels of a single stereo track, which
+// plays back stuck on one speaker. Force the input to stereo (mono sources
+// duplicate), then sum both channels into each output so audio is centered.
+// Runs before loudnorm so level is normalized on the corrected signal. Only
+// applied when the mic was captured — a system-audio-only recording has real
+// stereo content that must not be flattened.
+const AUDIO_DOWNMIX_FILTER: &str =
+    "aformat=channel_layouts=stereo,pan=stereo|FL=0.5*FL+0.5*FR|FR=0.5*FL+0.5*FR";
+// loudnorm operates internally at 192 kHz and emits at 192 kHz; without an
+// explicit output rate the AAC track ends up at 192 kHz and plays back slow.
+const AUDIO_OUTPUT_SAMPLE_RATE: u32 = 48000;
+
+// Loudness normalization, optionally preceded by the centered-stereo downmix
+// that repairs the mic+system L/R split. Pair with `-ar AUDIO_OUTPUT_SAMPLE_RATE`
+// so loudnorm's 192 kHz output is resampled back.
+fn audio_filter_chain(downmix: bool) -> String {
+    if downmix {
+        format!("{AUDIO_DOWNMIX_FILTER},{AUDIO_LOUDNESS_FILTER}")
+    } else {
+        AUDIO_LOUDNESS_FILTER.to_string()
+    }
+}
 const NATIVE_CAPTURE_MAX_LONG_EDGE: u32 = 1280;
 const NATIVE_CAPTURE_FPS: u32 = 24;
 const AVCONVERT_PATH: &str = "/usr/bin/avconvert";
@@ -60,10 +84,28 @@ const THUMBNAIL_MIME_TYPE: &str = "image/jpeg";
 const THUMBNAIL_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const THUMBNAIL_WIDTH: &str = "1280";
 const SIPS_PATH: &str = "/usr/bin/sips";
+// Minimum free space required to start recording; below this we hard-block.
+const DISK_SPACE_BLOCK_BYTES: u64 = 500 * 1024 * 1024;
+// Free space below this at start time is logged as a warning but not blocked.
+const DISK_SPACE_WARN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// Mid-recording warning threshold (emits clips:disk-space-warning).
+const DISK_MONITOR_WARN_BYTES: u64 = 1024 * 1024 * 1024;
+// Mid-recording critical threshold (emits clips:disk-space-critical).
+const DISK_MONITOR_CRITICAL_BYTES: u64 = 250 * 1024 * 1024;
+// How often the background monitor checks free space.
+const DISK_MONITOR_INTERVAL_SECS: u64 = 30;
 
 #[derive(Default)]
 pub struct NativeFullscreenRecordingState {
     inner: Mutex<Option<NativeFullscreenSession>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct NativeCaptureRegion {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 struct NativeFullscreenSession {
@@ -98,6 +140,9 @@ struct NativeFullscreenSession {
     /// warming up) but the recording output hasn't been attached yet, so
     /// nothing is written to disk. `begin` attaches it and flips this false.
     pending_recording_output: bool,
+    /// Stop flag for the background disk-space monitor thread. Set to true
+    /// when the session is finalized or discarded so the thread exits cleanly.
+    disk_monitor_stop: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -111,6 +156,8 @@ struct RestartInfo {
     segment_counter: u32,
     /// CGDirectDisplayID of the display to record. None = first available.
     target_display_id: Option<u32>,
+    /// Normalized display-relative capture rectangle for Region recordings.
+    capture_region: Option<NativeCaptureRegion>,
 }
 
 enum NativeFullscreenBackend {
@@ -210,6 +257,89 @@ fn format_mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+/// Returns free bytes on the volume containing `path`, or `None` on error.
+#[cfg(target_os = "macos")]
+fn free_disk_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    let c_path = CString::new(path.to_str()?).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } == 0 {
+        Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+    } else {
+        None
+    }
+}
+
+/// Spawns a background thread that checks free disk space every
+/// [`DISK_MONITOR_INTERVAL_SECS`] seconds and emits warning/critical events
+/// to the frontend. Returns a stop flag the caller sets to shut the thread down.
+#[cfg(target_os = "macos")]
+fn spawn_disk_monitor(app: AppHandle, recording_path: PathBuf) -> Arc<AtomicBool> {
+    // Use the parent directory for the statvfs call. The recording file itself
+    // may not exist yet (warm/begin path defers writing until after countdown),
+    // and statvfs returns ENOENT on non-existent paths. The parent dir is the
+    // pending-uploads folder, which always exists.
+    let check_path = recording_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or(recording_path);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        let tick_ms = 500u64;
+        let ticks_per_check = (DISK_MONITOR_INTERVAL_SECS * 1000) / tick_ms;
+        // Start at ticks_per_check so the first iteration runs an immediate check
+        // rather than waiting the full 30s interval. Subsequent checks are every 30s.
+        let mut ticks = ticks_per_check;
+        // True once a warning/critical event has been emitted; used to gate the
+        // recovery ok event so we only emit it on actual state transitions.
+        let mut was_elevated = false;
+        loop {
+            std::thread::sleep(Duration::from_millis(tick_ms));
+            if stop_clone.load(Ordering::Relaxed) {
+                return;
+            }
+            ticks += 1;
+            if ticks < ticks_per_check {
+                continue;
+            }
+            ticks = 0;
+            if let Some(free) = free_disk_bytes(&check_path) {
+                let free_mb = free / (1024 * 1024);
+                if free < DISK_MONITOR_CRITICAL_BYTES {
+                    eprintln!(
+                        "[clips-tray] disk space critical during recording: {} free",
+                        format_mb(free)
+                    );
+                    let _ = app.emit(
+                        "clips:disk-space-critical",
+                        serde_json::json!({ "freeMb": free_mb }),
+                    );
+                    was_elevated = true;
+                } else if free < DISK_MONITOR_WARN_BYTES {
+                    eprintln!(
+                        "[clips-tray] disk space low during recording: {} free",
+                        format_mb(free)
+                    );
+                    let _ = app.emit(
+                        "clips:disk-space-warning",
+                        serde_json::json!({ "freeMb": free_mb }),
+                    );
+                    was_elevated = true;
+                } else if was_elevated {
+                    // Space recovered — notify the UI to clear its warning.
+                    let _ = app.emit(
+                        "clips:disk-space-ok",
+                        serde_json::json!({ "freeMb": free_mb }),
+                    );
+                    was_elevated = false;
+                }
+            }
+        }
+    });
+    stop
+}
+
 fn emit_native_upload_progress(
     app: &AppHandle,
     stage: &str,
@@ -240,11 +370,20 @@ struct SavedNativeRecording {
     height: Option<u32>,
     bytes: u64,
     has_audio: bool,
+    // Whether the mic was captured. Drives the centered-stereo downmix repair
+    // for the mic+system L/R split. Defaults to false for recordings queued
+    // before this field existed so their audio is left untouched.
+    #[serde(default)]
+    mic_captured: bool,
     has_camera: bool,
     saved_at: String,
     last_attempt_at: Option<String>,
     last_error: Option<String>,
     retry_count: u32,
+    /// True when the SCK finalization callback reported an error, meaning the
+    /// MP4 is missing its moov atom and cannot be recovered by retrying.
+    #[serde(default)]
+    corrupt: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,6 +402,7 @@ pub struct PendingNativeRecording {
     last_attempt_at: Option<String>,
     last_error: Option<String>,
     retry_count: u32,
+    corrupt: bool,
 }
 
 #[derive(Serialize)]
@@ -324,6 +464,7 @@ impl From<&SavedNativeRecording> for PendingNativeRecording {
             last_attempt_at: saved.last_attempt_at.clone(),
             last_error: saved.last_error.clone(),
             retry_count: saved.retry_count,
+            corrupt: saved.corrupt,
         }
     }
 }
@@ -364,6 +505,7 @@ fn start_native_session_locked(
     capture_system_audio: bool,
     mic_device_id: Option<String>,
     mic_device_label: Option<String>,
+    capture_region: Option<NativeCaptureRegion>,
     defer_recording_output: bool,
 ) -> Result<NativeFullscreenStartInfo, String> {
     let safe_id = sanitize_recording_id(recording_id);
@@ -380,6 +522,7 @@ fn start_native_session_locked(
         capture_system_audio,
         mic_device_id.as_deref(),
         mic_device_label.as_deref(),
+        capture_region,
         defer_recording_output,
     ) {
         Ok(session) => session,
@@ -395,7 +538,14 @@ fn start_native_session_locked(
             eprintln!(
                 "[clips-tray] ScreenCaptureKit recording unavailable; falling back to screencapture: {sck_err}"
             );
-            start_screencapture_recording(app, &safe_id, include_audio, capture_system_audio).map_err(|fallback_err| {
+            start_screencapture_recording(
+                app,
+                &safe_id,
+                include_audio,
+                capture_system_audio,
+                capture_region,
+            )
+            .map_err(|fallback_err| {
                 format!(
                     "ScreenCaptureKit recording failed ({sck_err}); screencapture fallback failed ({fallback_err})"
                 )
@@ -442,6 +592,7 @@ pub async fn native_fullscreen_recording_warm(
     capture_system_audio: bool,
     mic_device_id: Option<String>,
     mic_device_label: Option<String>,
+    capture_region: Option<NativeCaptureRegion>,
 ) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -453,6 +604,7 @@ pub async fn native_fullscreen_recording_warm(
             capture_system_audio,
             mic_device_id,
             mic_device_label,
+            capture_region,
         );
         Ok(())
     }
@@ -472,6 +624,7 @@ pub async fn native_fullscreen_recording_warm(
                 capture_system_audio,
                 mic_device_id,
                 mic_device_label,
+                capture_region,
                 true,
             ) {
                 eprintln!(
@@ -496,6 +649,7 @@ pub async fn native_fullscreen_recording_begin(
     capture_system_audio: bool,
     mic_device_id: Option<String>,
     mic_device_label: Option<String>,
+    capture_region: Option<NativeCaptureRegion>,
 ) -> Result<NativeFullscreenStartInfo, String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -507,6 +661,7 @@ pub async fn native_fullscreen_recording_begin(
             capture_system_audio,
             mic_device_id,
             mic_device_label,
+            capture_region,
         );
         return Err("Native full-screen recording is currently macOS-only.".into());
     }
@@ -529,6 +684,7 @@ pub async fn native_fullscreen_recording_begin(
                 capture_system_audio,
                 mic_device_id,
                 mic_device_label,
+                capture_region,
                 false,
             );
         }
@@ -616,6 +772,35 @@ pub async fn native_fullscreen_recording_stop_and_upload(
     )?;
     if let Err(stop_err) = &stop_outcome {
         saved.last_error = Some(stop_err.clone());
+        // Only mark corrupt when the SCK delegate explicitly called recording_did_fail
+        // (error contains "finalize failed"). Transient stop_capture /
+        // remove_recording_output errors also return Err but don't prove the moov
+        // was never written — they should remain retryable.
+        // "finalization callback failed" is unique to the delegate path;
+        // "recording finalize failed" also appears on remove_recording_output errors.
+        let is_definitive = stop_err.contains("finalization callback failed");
+        if is_definitive && mp4_has_moov(&saved.file_path) == Some(false) {
+            saved.corrupt = true;
+            eprintln!(
+                "[clips-tray] recording marked corrupt: definitive finalize error + missing moov atom"
+            );
+        }
+    } else if mp4_has_moov(&saved.file_path) == Some(false) {
+        // stop_outcome was Ok but the finalize callback timed out — SCK may still be
+        // flushing the moov atom. Persist metadata so the clip appears as retryable
+        // in the UI, then bail out before upload_recording_file re-checks moov and
+        // permanently marks it corrupt.
+        saved.last_error = Some(
+            "Recorded MP4 is missing playback metadata. Please retry the recording."
+                .to_string(),
+        );
+        eprintln!("[clips-tray] recording missing moov after Ok stop outcome (likely finalize timeout) — saving as retryable, skipping upload");
+        write_saved_recording_metadata(&app, &saved)?;
+        emit_native_upload_progress(&app, "failed", "Upload paused", None, None);
+        return Err(
+            "Recorded MP4 is missing playback metadata. Please retry the recording."
+                .to_string(),
+        );
     } else if let Err(merge_err) = &consolidate_outcome {
         saved.last_error = Some(merge_err.clone());
     }
@@ -656,6 +841,9 @@ pub async fn native_fullscreen_recording_stop_and_upload(
             saved.last_attempt_at = Some(now_iso());
             saved.last_error = Some(err.clone());
             saved.retry_count = saved.retry_count.saturating_add(1);
+            if is_moov_corrupt_error(&err) {
+                saved.corrupt = true;
+            }
             let _ = write_saved_recording_metadata(&app, &saved);
             emit_native_upload_progress(&app, "failed", "Upload paused", None, None);
             Err(format!(
@@ -693,6 +881,37 @@ pub async fn native_fullscreen_recording_stop_and_save(
                 "segment consolidation failed: {merge_err}. The raw segments remain in the pending recordings folder."
             ));
         }
+    }
+    // Only treat the file as permanently unrecoverable when the SCK delegate
+    // explicitly called recording_did_fail (error contains "finalization callback failed",
+    // the unique prefix used by the delegate path). Transient stop_capture /
+    // remove_recording_output errors use "recording finalize failed" and should
+    // remain retryable — deleting on those would risk silent data loss.
+    let is_definitive_finalize_error = stop_outcome
+        .as_ref()
+        .err()
+        .map(|e| e.contains("finalization callback failed"))
+        .unwrap_or(false);
+    if is_definitive_finalize_error {
+        if mp4_has_moov(&session.path) == Some(false) {
+            eprintln!(
+                "[clips-tray] native local recording corrupt (finalize error + missing moov) — not exporting"
+            );
+            let _ = std::fs::remove_file(&session.path);
+            return Err(
+                "Recorded file is corrupted — the video is incomplete and cannot be saved. \
+                 Please record again."
+                    .into(),
+            );
+        }
+    } else if mp4_has_moov(&session.path) == Some(false) {
+        // Non-definitive case (transient error or finalize timeout): the moov may
+        // still be flushing. Proceed with the export so the file lands in the
+        // user-requested folder and is accessible — stranding it in an internal
+        // pending folder with no metadata would leave it unrecoverable.
+        eprintln!(
+            "[clips-tray] native local recording has no moov after finalize; exporting anyway so user can access the file"
+        );
     }
 
     save_native_recording_to_local_export(&app, &session, &folder_name, &file_role, duration_ms)
@@ -787,6 +1006,20 @@ pub async fn native_fullscreen_recording_resume(
     let segment_path = segment_path_for(&app, &restart.safe_id, extension, next_counter)?;
     let _ = std::fs::remove_file(&segment_path);
 
+    // Re-check disk space before starting the new segment. The mid-recording
+    // monitor warns but does not block, so space can drop below the hard limit
+    // between the initial start and a resume without being caught here.
+    #[cfg(target_os = "macos")]
+    if let Some(free) = free_disk_bytes(segment_path.parent().unwrap_or(&segment_path)) {
+        if free < DISK_SPACE_BLOCK_BYTES {
+            return Err(format!(
+                "Not enough disk space to resume recording. Free up at least {} and try again (currently {} free).",
+                format_mb(DISK_SPACE_BLOCK_BYTES),
+                format_mb(free)
+            ));
+        }
+    }
+
     // Start the new segment backend FIRST. Only clear paused state if it
     // succeeds — otherwise the session would be left with no backend but
     // appear running, which silently drops everything after the resume.
@@ -799,6 +1032,7 @@ pub async fn native_fullscreen_recording_resume(
         restart.mic_device_label.as_deref(),
         &segment_path,
         restart.target_display_id,
+        restart.capture_region,
     )?;
     session.backend = Some(backend);
     session.segments.push(segment_path);
@@ -840,6 +1074,10 @@ fn take_and_finalize_active_session(
     }
     .ok_or_else(|| "No native full-screen recording is active.".to_string())?;
 
+    // Signal the disk monitor to stop before tearing down the backend.
+    if let Some(stop) = &session.disk_monitor_stop {
+        stop.store(true, Ordering::Relaxed);
+    }
     // Try to finalize capture, but don't early-return on failure: the
     // underlying MP4 file is already on disk after stop_capture(), and
     // ScreenCaptureKit's StreamError("invalid parameter") on
@@ -896,6 +1134,9 @@ fn finalize_active_backend(
 /// session displaced by a new start). Finalizes any active backend and
 /// deletes every on-disk artifact — segment files and the final path.
 fn discard_session(session: &mut NativeFullscreenSession) {
+    if let Some(stop) = &session.disk_monitor_stop {
+        stop.store(true, Ordering::Relaxed);
+    }
     let _ = finalize_active_backend(session, false);
     for segment in &session.segments {
         let _ = std::fs::remove_file(segment);
@@ -928,6 +1169,7 @@ fn start_segment_backend(
     mic_device_label: Option<&str>,
     segment_path: &Path,
     target_display_id: Option<u32>,
+    capture_region: Option<NativeCaptureRegion>,
 ) -> Result<(NativeFullscreenBackend, Option<u32>, Option<u32>), String> {
     #[cfg(target_os = "macos")]
     {
@@ -942,6 +1184,7 @@ fn start_segment_backend(
             mic_device_id,
             mic_device_label,
             target_display_id,
+            capture_region,
             // Resume records immediately — the mic was already warmed by the
             // initial start, so there's no silent-head to avoid here.
             false,
@@ -953,13 +1196,18 @@ fn start_segment_backend(
                 );
             }
         }
-        let (backend, w, h) =
-            start_screencapture_backend_at(segment_path, include_audio, target_display_id)
-                .map_err(|fallback_err| {
-                    format!(
+        let (backend, w, h) = start_screencapture_backend_at(
+            app,
+            segment_path,
+            include_audio,
+            target_display_id,
+            capture_region,
+        )
+        .map_err(|fallback_err| {
+            format!(
                 "ScreenCaptureKit resume failed; screencapture fallback failed ({fallback_err})"
             )
-                })?;
+        })?;
         Ok((backend, w, h))
     }
     #[cfg(not(target_os = "macos"))]
@@ -972,6 +1220,8 @@ fn start_segment_backend(
             mic_device_id,
             mic_device_label,
             segment_path,
+            target_display_id,
+            capture_region,
         );
         Err("Native full-screen recording is currently macOS-only.".into())
     }
@@ -987,6 +1237,7 @@ fn start_screencapturekit_backend_at(
     mic_device_id: Option<&str>,
     mic_device_label: Option<&str>,
     target_display_id: Option<u32>,
+    capture_region: Option<NativeCaptureRegion>,
     // When true the SCStream is started WITHOUT attaching the recording
     // output — capture runs (warming the mic) but nothing is written until
     // `add_recording_output` is called later by `begin`. When false the
@@ -1005,11 +1256,20 @@ fn start_screencapturekit_backend_at(
 
     let source_width = display.width();
     let source_height = display.height();
-    let (width, height) = native_capture_dimensions(source_width, source_height);
-    let filter = SCContentFilter::create()
+    let region_rect = region_source_rect(capture_region, source_width, source_height)?;
+    let (capture_width, capture_height) = region_rect
+        .as_ref()
+        .map(|(_, width, height)| (*width, *height))
+        .unwrap_or((source_width, source_height));
+    let (width, height) = native_capture_dimensions(capture_width, capture_height);
+    let filter_builder = SCContentFilter::create()
         .with_display(display)
-        .with_excluding_windows(&[])
-        .build();
+        .with_excluding_windows(&[]);
+    let filter = if let Some((rect, _, _)) = region_rect {
+        filter_builder.with_content_rect(rect).build()
+    } else {
+        filter_builder.build()
+    };
     let selected_mic = if include_audio {
         resolve_microphone_capture_device(mic_device_id, mic_device_label)?
     } else {
@@ -1029,6 +1289,9 @@ fn start_screencapturekit_backend_at(
         .with_excludes_current_process_audio(true)
         .with_sample_rate(48000)
         .with_channel_count(2);
+    if let Some((rect, _, _)) = region_rect {
+        config.set_source_rect(rect);
+    }
     if let Some(device) = selected_mic.as_ref() {
         config.set_microphone_capture_device_id(&device.id);
         eprintln!(
@@ -1081,7 +1344,7 @@ fn start_screencapturekit_backend_at(
         return Err(format!("capture start failed: {err:?}"));
     }
     eprintln!(
-        "[clips-tray] ScreenCaptureKit recording started: {width}x{height} @ {NATIVE_CAPTURE_FPS}fps from {source_width}x{source_height}, mic={include_audio} system_audio={capture_system_audio} deferred_output={defer_recording_output}"
+        "[clips-tray] ScreenCaptureKit recording started: {width}x{height} @ {NATIVE_CAPTURE_FPS}fps from {capture_width}x{capture_height} (display {source_width}x{source_height}), mic={include_audio} system_audio={capture_system_audio} deferred_output={defer_recording_output}"
     );
     Ok((
         NativeFullscreenBackend::ScreenCaptureKit {
@@ -1099,9 +1362,11 @@ fn start_screencapturekit_backend_at(
 /// Shared by the initial start and the resume path.
 #[cfg(target_os = "macos")]
 fn start_screencapture_backend_at(
+    app: &AppHandle,
     output_path: &Path,
     include_audio: bool,
     target_display_id: Option<u32>,
+    capture_region: Option<NativeCaptureRegion>,
 ) -> Result<(NativeFullscreenBackend, Option<u32>, Option<u32>), String> {
     if !std::path::Path::new("/usr/sbin/screencapture").exists() {
         return Err("macOS screencapture is unavailable on this machine.".into());
@@ -1116,6 +1381,24 @@ fn start_screencapture_backend_at(
             })
         })
         .unwrap_or_else(|| "-D1".to_string());
+    let (region_arg, region_width, region_height) = if let Some(region) = capture_region {
+        let (mx, my, mw, mh) = crate::util::tray_monitor_physical_rect(app);
+        let (rect, width, height) = region_source_rect(Some(region), mw, mh)?
+            .ok_or_else(|| "Recording region is unavailable.".to_string())?;
+        (
+            Some(format!(
+                "{},{},{},{}",
+                mx + rect.x.round() as i32,
+                my + rect.y.round() as i32,
+                rect.width.round() as u32,
+                rect.height.round() as u32
+            )),
+            Some(width),
+            Some(height),
+        )
+    } else {
+        (None, None, None)
+    };
     let mut command = Command::new("/usr/sbin/screencapture");
     command
         .arg("-v")
@@ -1127,6 +1410,9 @@ fn start_screencapture_backend_at(
         .stderr(Stdio::null());
     if include_audio {
         command.arg("-g");
+    }
+    if let Some(region_arg) = region_arg {
+        command.arg(format!("-R{region_arg}"));
     }
     command.arg(output_path);
     let mut child = command
@@ -1143,7 +1429,11 @@ fn start_screencapture_backend_at(
         ));
     }
     eprintln!("[clips-tray] screencapture recording started");
-    Ok((NativeFullscreenBackend::Screencapture { child }, None, None))
+    Ok((
+        NativeFullscreenBackend::Screencapture { child },
+        region_width,
+        region_height,
+    ))
 }
 
 /// After all segments are finalized, make sure `session.path` contains a
@@ -1266,11 +1556,17 @@ pub async fn native_fullscreen_recording_retry_upload(
             Ok(result)
         }
         Err(err) => {
+            if is_moov_corrupt_error(&err) {
+                saved.corrupt = true;
+            }
             persist_saved_recording_error(&app, &mut saved, &err);
             emit_native_upload_progress(&app, "failed", "Retry paused", None, None);
-            Err(format!(
-                "{err}. The local copy is still saved, so you can retry again."
-            ))
+            let suffix = if saved.corrupt {
+                "The file is corrupted and cannot be recovered."
+            } else {
+                "The local copy is still saved, so you can retry again."
+            };
+            Err(format!("{err}. {suffix}"))
         }
     }
 }
@@ -1669,11 +1965,13 @@ fn saved_recording_from_session(
         height: session.height,
         bytes,
         has_audio,
+        mic_captured: session.restart.include_audio,
         has_camera,
         saved_at: now_iso(),
         last_attempt_at: None,
         last_error: None,
         retry_count: 0,
+        corrupt: false,
     })
 }
 
@@ -1796,6 +2094,7 @@ fn start_screencapturekit_recording(
     capture_system_audio: bool,
     mic_device_id: Option<&str>,
     mic_device_label: Option<&str>,
+    capture_region: Option<NativeCaptureRegion>,
     defer_recording_output: bool,
 ) -> Result<NativeFullscreenSession, String> {
     let target_display_id = tray_display_id(app);
@@ -1805,6 +2104,21 @@ fn start_screencapturekit_recording(
         "[clips-tray] starting ScreenCaptureKit recording -> {}",
         path.display()
     );
+    let check_path = path.parent().unwrap_or(&path);
+    if let Some(free) = free_disk_bytes(check_path) {
+        if free < DISK_SPACE_BLOCK_BYTES {
+            return Err(format!(
+                "Not enough disk space to record. Free up at least {} and try again (currently {} free).",
+                format_mb(DISK_SPACE_BLOCK_BYTES),
+                format_mb(free)
+            ));
+        } else if free < DISK_SPACE_WARN_BYTES {
+            eprintln!(
+                "[clips-tray] low disk space at recording start: {} free — recording may fail if space runs out",
+                format_mb(free)
+            );
+        }
+    }
     let (backend, width, height) = start_screencapturekit_backend_at(
         &path,
         include_audio,
@@ -1812,6 +2126,7 @@ fn start_screencapturekit_recording(
         mic_device_id,
         mic_device_label,
         target_display_id,
+        capture_region,
         defer_recording_output,
     )?;
     let (fallback_width, fallback_height) = primary_monitor_size(app);
@@ -1829,9 +2144,11 @@ fn start_screencapturekit_recording(
             mic_device_label: mic_device_label.map(str::to_string),
             segment_counter: 0,
             target_display_id,
+            capture_region,
         },
     );
     session.pending_recording_output = defer_recording_output;
+    session.disk_monitor_stop = Some(spawn_disk_monitor(app.clone(), session.path.clone()));
     Ok(session)
 }
 
@@ -1841,6 +2158,7 @@ fn start_screencapture_recording(
     safe_id: &str,
     include_audio: bool,
     capture_system_audio: bool,
+    capture_region: Option<NativeCaptureRegion>,
 ) -> Result<NativeFullscreenSession, String> {
     let target_display_id = tray_display_id(app);
     let path = pending_recording_path(app, safe_id, "mov")?;
@@ -1849,15 +2167,34 @@ fn start_screencapture_recording(
         "[clips-tray] starting screencapture (fallback) recording -> {}",
         path.display()
     );
-    let (backend, _w, _h) =
-        start_screencapture_backend_at(&path, include_audio, target_display_id)?;
-    let (width, height) = primary_monitor_size(app);
-    Ok(new_fullscreen_session(
+    if let Some(free) = free_disk_bytes(path.parent().unwrap_or(&path)) {
+        if free < DISK_SPACE_BLOCK_BYTES {
+            return Err(format!(
+                "Not enough disk space to record. Free up at least {} and try again (currently {} free).",
+                format_mb(DISK_SPACE_BLOCK_BYTES),
+                format_mb(free)
+            ));
+        } else if free < DISK_SPACE_WARN_BYTES {
+            eprintln!(
+                "[clips-tray] low disk space at recording start: {} free — recording may fail if space runs out",
+                format_mb(free)
+            );
+        }
+    }
+    let (backend, w, h) = start_screencapture_backend_at(
+        app,
+        &path,
+        include_audio,
+        target_display_id,
+        capture_region,
+    )?;
+    let (fallback_width, fallback_height) = primary_monitor_size(app);
+    let mut session = new_fullscreen_session(
         backend,
         path,
         QUICKTIME_RECORDING_MIME_TYPE,
-        width,
-        height,
+        w.or(fallback_width),
+        h.or(fallback_height),
         RestartInfo {
             safe_id: safe_id.to_string(),
             include_audio,
@@ -1868,8 +2205,11 @@ fn start_screencapture_recording(
             mic_device_label: None,
             segment_counter: 0,
             target_display_id,
+            capture_region,
         },
-    ))
+    );
+    session.disk_monitor_stop = Some(spawn_disk_monitor(app.clone(), session.path.clone()));
+    Ok(session)
 }
 
 /// Build a fresh `NativeFullscreenSession` around a freshly-started
@@ -1895,6 +2235,7 @@ fn new_fullscreen_session(
         paused_at: None,
         restart,
         pending_recording_output: false,
+        disk_monitor_stop: None,
     }
 }
 
@@ -1929,6 +2270,48 @@ fn native_capture_dimensions(width: u32, height: u32) -> (u32, u32) {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn region_source_rect(
+    region: Option<NativeCaptureRegion>,
+    source_width: u32,
+    source_height: u32,
+) -> Result<Option<(CGRect, u32, u32)>, String> {
+    let Some(region) = region else {
+        return Ok(None);
+    };
+    let clamp_unit = |value: f64| {
+        if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let source_width = source_width.max(2);
+    let source_height = source_height.max(2);
+    let x = clamp_unit(region.x) * source_width as f64;
+    let y = clamp_unit(region.y) * source_height as f64;
+    let max_width = (source_width as f64 - x).max(1.0);
+    let max_height = (source_height as f64 - y).max(1.0);
+    let width = (clamp_unit(region.width) * source_width as f64)
+        .clamp(1.0, max_width)
+        .floor();
+    let height = (clamp_unit(region.height) * source_height as f64)
+        .clamp(1.0, max_height)
+        .floor();
+
+    let width_u32 = width as u32;
+    let height_u32 = height as u32;
+    if width_u32 < 2 || height_u32 < 2 {
+        return Err("Recording region is too small.".into());
+    }
+
+    Ok(Some((
+        CGRect::new(x.floor(), y.floor(), width, height),
+        width_u32,
+        height_u32,
+    )))
+}
+
 /// How long to wait for `SCRecordingOutput` to flush its trailing fragment
 /// and write the `moov` after we ask it to stop. Normal finalize is well
 /// under a second for these clips; this is only a safety ceiling for the
@@ -1960,17 +2343,17 @@ fn stop_native_recording(
                 .map_err(|e| format!("ScreenCaptureKit stop failed: {e:?}"));
             // remove_recording_output() occasionally fails with
             // StreamError("Failed due to an invalid parameter") when the audio
-            // tap or stream state hasn't fully drained yet. Retry once after a
-            // short pause before giving up — the underlying MP4 file is
-            // already on disk by this point, so the recovery path can still
-            // pick it up via write_saved_recording_metadata().
+            // tap or stream state hasn't fully drained yet. We retry once after
+            // a 200ms drain delay; the sleep is in the error branch only so
+            // healthy clips pay no extra stop latency.
             let remove_result = stream
                 .remove_recording_output(recording)
                 .map_err(|e| format!("ScreenCaptureKit recording finalize failed: {e:?}"));
             let remove_result = match remove_result {
                 Ok(v) => Ok(v),
                 Err(first_err) => {
-                    std::thread::sleep(Duration::from_millis(150));
+                    eprintln!("[clips-tray] waiting 200ms for SCK frame buffer to drain before remove_recording_output retry");
+                    std::thread::sleep(Duration::from_millis(200));
                     stream.remove_recording_output(recording).map_err(|e| {
                         format!(
                             "ScreenCaptureKit recording finalize failed (retry): {e:?}; first attempt: {first_err}"
@@ -2000,12 +2383,25 @@ fn stop_native_recording(
                 None
             };
 
+            // Check the delegate outcome BEFORE returning on stop_result. When
+            // stop_capture() fails AND recording_did_fail fires, callers must see
+            // the "finalization callback failed" prefix to correctly identify
+            // permanent corruption — the stop_capture error string would mask it.
+            if let Some(Err(err)) = &finalize_outcome {
+                eprintln!("[clips-tray] SCK finalize failed: {err}");
+                // Use a unique prefix so callers can distinguish the SCK delegate
+                // reporting failure (recording_did_fail) from teardown API errors.
+                return Err(format!("ScreenCaptureKit finalization callback failed: {err}"));
+            }
+
             if let Err(err) = stop_result {
                 return Err(err);
             }
-
-            if let Some(Err(err)) = &finalize_outcome {
-                return Err(format!("ScreenCaptureKit recording finalize failed: {err}"));
+            if waited_for_finalize && finalize_outcome.is_none() {
+                eprintln!(
+                    "[clips-tray] SCK finalize timed out after {}s — moov atom may be missing",
+                    SCK_FINALIZE_TIMEOUT.as_secs()
+                );
             }
 
             match remove_result {
@@ -2082,6 +2478,7 @@ async fn upload_recording_file(
         session.height,
         Some(duration_ms),
         has_audio,
+        session.restart.include_audio,
     )?;
     let upload_result = upload_prepared_recording_file(
         app,
@@ -2118,6 +2515,7 @@ async fn upload_saved_recording_file(
         saved.height,
         Some(saved.duration_ms),
         saved.has_audio,
+        saved.mic_captured,
     )?;
     let upload_result = upload_prepared_recording_file(
         app,
@@ -2423,6 +2821,81 @@ fn upload_url(
     Ok(url.to_string())
 }
 
+/// Returns true when an upload error string indicates the file is permanently
+/// corrupt (missing moov atom) and cannot be recovered by retrying.
+fn is_moov_corrupt_error(err: &str) -> bool {
+    // Matches both the native prepare_recording_file error and the server-side
+    // finalize-recording.ts error so the corrupt flag is set regardless of
+    // which layer first detected the missing moov atom.
+    err.contains("video is missing required metadata")
+        || err.contains("corrupted or incomplete")
+}
+
+/// Walk the top-level ISO BMFF boxes of a file and return `Some(true)` when a
+/// `moov` box is present, `Some(false)` when the scan reached EOF without
+/// finding one (file is unplayable), or `None` when the file could not be
+/// read (transient I/O error — callers must not treat this as permanent
+/// corruption).
+fn mp4_has_moov(path: &Path) -> Option<bool> {
+    use std::io::{ErrorKind, Read, Seek, SeekFrom};
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[clips-tray] mp4_has_moov: could not open file for moov scan: {e}");
+            return None;
+        }
+    };
+    let mut buf = [0u8; 8];
+    loop {
+        match f.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                // Clean EOF — moov was never found; file is missing the atom.
+                return Some(false);
+            }
+            Err(_) => return None, // Transient read error; don't mark as corrupt.
+        }
+        let box_size_raw = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let box_type = &buf[4..8];
+        if box_type == b"moov" {
+            return Some(true);
+        }
+        let skip: u64 = match box_size_raw {
+            0 => return Some(false), // box extends to EOF — moov not before it
+            1 => {
+                // 64-bit extended-size: next 8 bytes hold the real size.
+                let mut ext = [0u8; 8];
+                match f.read_exact(&mut ext) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Some(false),
+                    Err(_) => return None,
+                }
+                let full = u64::from_be_bytes(ext);
+                // full includes the 8-byte header + 8-byte ext field (16 total).
+                full.saturating_sub(16)
+            }
+            // Sizes 2-7 are below the minimum valid box size (8 bytes).
+            // saturating_sub would produce 0, causing skip=0 and an infinite
+            // loop since the file position would never advance.
+            n if n < 8 => return Some(false),
+            n => (n as u64).saturating_sub(8),
+        };
+        if skip > 0 {
+            // Use SeekFrom::Current with a checked i64 cast; a valid box
+            // whose payload exceeds i64::MAX (~9 EiB) is treated as
+            // malformed — return Some(false) so callers can surface the
+            // error without wrapping or seeking backwards.
+            let offset = match i64::try_from(skip) {
+                Ok(v) => v,
+                Err(_) => return Some(false),
+            };
+            if f.seek(SeekFrom::Current(offset)).is_err() {
+                return None; // seek I/O error — don't assume corruption
+            }
+        }
+    }
+}
+
 fn prepare_recording_file(
     app: &AppHandle,
     path: &Path,
@@ -2431,6 +2904,7 @@ fn prepare_recording_file(
     height: Option<u32>,
     duration_ms: Option<u128>,
     has_audio: bool,
+    downmix_audio: bool,
 ) -> Result<PreparedRecordingFile, String> {
     let metadata = std::fs::metadata(path).map_err(|e| {
         let diag = describe_recording_path(path);
@@ -2444,6 +2918,22 @@ fn prepare_recording_file(
             describe_recording_path(path)
         );
         return Err("Native recording produced an empty file.".into());
+    }
+    // For MP4/QuickTime files check that a top-level moov atom exists. SCK
+    // finalization errors (-5814) produce a file with ftyp + mdat but no
+    // moov, making it permanently unplayable. Catching this here avoids a
+    // full chunked upload that the server will reject anyway.
+    if mime_type == "video/mp4" || mime_type == "video/quicktime" {
+        if mp4_has_moov(path) == Some(false) {
+            eprintln!(
+                "[clips-tray] native recording corrupt moov check failed — skipping upload"
+            );
+            return Err(
+                "Recorded file is corrupted or incomplete — the video is missing required \
+                 metadata. Please record again."
+                    .into(),
+            );
+        }
     }
     emit_native_upload_progress(app, "preparing", "Optimizing clip", None, None);
 
@@ -2462,7 +2952,12 @@ fn prepare_recording_file(
             if let Some(ffmpeg_path) = ffmpeg_path.as_deref() {
                 let normalized_path = normalized_recording_path(path);
                 let _ = std::fs::remove_file(&normalized_path);
-                match normalize_audio_with_ffmpeg(ffmpeg_path, path, &normalized_path) {
+                match normalize_audio_with_ffmpeg(
+                    ffmpeg_path,
+                    path,
+                    &normalized_path,
+                    downmix_audio,
+                ) {
                     Ok(()) => {
                         let normalized_bytes = std::fs::metadata(&normalized_path)
                             .map_err(|e| format!("normalized recording file missing: {e}"))?
@@ -2520,6 +3015,7 @@ fn prepare_recording_file(
                 height,
                 duration_ms,
                 has_audio,
+                downmix_audio,
             ) {
                 Ok(()) => {
                     let compressed_bytes = std::fs::metadata(&compressed_path)
@@ -2838,6 +3334,7 @@ fn normalize_audio_with_ffmpeg(
     ffmpeg_path: &str,
     source: &Path,
     output: &Path,
+    downmix_audio: bool,
 ) -> Result<(), String> {
     let audio_bitrate = format!("{NORMALIZED_AUDIO_BITRATE_KBPS}k");
     let mut command = Command::new(ffmpeg_path);
@@ -2859,9 +3356,11 @@ fn normalize_audio_with_ffmpeg(
         .arg("-b:a")
         .arg(audio_bitrate)
         .arg("-af")
-        .arg(AUDIO_LOUDNESS_FILTER)
+        .arg(audio_filter_chain(downmix_audio))
         .arg("-ac")
         .arg("2")
+        .arg("-ar")
+        .arg(AUDIO_OUTPUT_SAMPLE_RATE.to_string())
         .arg("-movflags")
         .arg("+faststart")
         .arg("-f")
@@ -2920,6 +3419,7 @@ fn transcode_with_ffmpeg(
     height: Option<u32>,
     duration_ms: Option<u128>,
     normalize_audio: bool,
+    downmix_audio: bool,
 ) -> Result<(), String> {
     let mut command = Command::new(ffmpeg_path);
     command
@@ -2943,7 +3443,7 @@ fn transcode_with_ffmpeg(
     }
 
     if normalize_audio {
-        command.arg("-af").arg(AUDIO_LOUDNESS_FILTER);
+        command.arg("-af").arg(audio_filter_chain(downmix_audio));
     }
 
     let duration_rate_limit =
@@ -2982,6 +3482,8 @@ fn transcode_with_ffmpeg(
         .arg(audio_bitrate)
         .arg("-ac")
         .arg("2")
+        .arg("-ar")
+        .arg(AUDIO_OUTPUT_SAMPLE_RATE.to_string())
         .arg("-movflags")
         .arg("+faststart")
         .arg("-f")

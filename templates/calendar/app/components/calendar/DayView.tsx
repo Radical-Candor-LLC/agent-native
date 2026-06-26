@@ -1,4 +1,6 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { useT } from "@agent-native/core/client";
+import type { CalendarEvent } from "@shared/api";
+import { IconAlertTriangleFilled } from "@tabler/icons-react";
 import {
   eachHourOfInterval,
   format,
@@ -12,16 +14,17 @@ import {
   addDays,
   min,
 } from "date-fns";
-import { cn } from "@/lib/utils";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+
+import { useCalendarContext } from "@/components/layout/AppLayout";
+import { useEventDrag } from "@/hooks/use-event-drag";
+import { useViewPreferences } from "@/hooks/use-view-preferences";
+import { getEventDisplayColor, allOtherDeclined } from "@/lib/event-colors";
 import { shouldSuppressAfterPopoverClose } from "@/lib/popover-click-guard";
 import { EventStatusIcon } from "@/lib/rsvp-status";
-import { getEventDisplayColor, allOtherDeclined } from "@/lib/event-colors";
-import { IconAlertTriangleFilled } from "@tabler/icons-react";
+import { cn } from "@/lib/utils";
+
 import { EventDetailPopover } from "./EventDetailPopover";
-import type { CalendarEvent } from "@shared/api";
-import { useEventDrag } from "@/hooks/use-event-drag";
-import { useCalendarContext } from "@/components/layout/AppLayout";
-import { useViewPreferences } from "@/hooks/use-view-preferences";
 
 interface DayViewProps {
   events: CalendarEvent[];
@@ -128,6 +131,7 @@ export function DayView({
   onDraftDiscard,
   isLoading = false,
 }: DayViewProps) {
+  const t = useT();
   const { setFocusedEvent } = useCalendarContext();
   const { prefs } = useViewPreferences();
   const [now, setNow] = useState(new Date());
@@ -243,7 +247,7 @@ export function DayView({
       {allDayEvents.length > 0 && (
         <div className="border-b border-border bg-card/50 px-4 py-2">
           <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            All day
+            {t("eventForm.allDay")}
           </p>
           <div className="space-y-1">
             {allDayEvents.map((event) => {
@@ -262,7 +266,17 @@ export function DayView({
                   onDraftDiscard={onDraftDiscard}
                 >
                   <button
-                    className="flex w-full items-center gap-1.5 rounded-md px-3 py-1.5 text-left text-sm font-medium text-foreground transition-all hover:brightness-110"
+                    className={cn(
+                      "relative flex w-full items-center gap-1.5 rounded-md px-3 py-1.5 text-left text-sm font-medium text-foreground transition-all hover:brightness-110",
+                      event.ownerColor && "pr-5",
+                    )}
+                    aria-label={
+                      event.ownerName || event.overlayEmail
+                        ? `${event.title}, ${
+                            event.ownerName || event.overlayEmail
+                          }'s calendar`
+                        : event.title
+                    }
                     style={
                       color
                         ? {
@@ -283,6 +297,13 @@ export function DayView({
                     )}
                     <EventStatusIcon event={event} className="shrink-0" />
                     <span className="truncate">{event.title}</span>
+                    {event.ownerColor && (
+                      <span
+                        aria-hidden="true"
+                        className="absolute right-2 top-1/2 size-1.5 -translate-y-1/2 rounded-full ring-1 ring-background/70"
+                        style={{ backgroundColor: event.ownerColor }}
+                      />
+                    )}
                   </button>
                 </EventDetailPopover>
               );
@@ -458,7 +479,15 @@ export function DayView({
                     isBeingDragged && isDragging && "ring-2 ring-primary/40",
                     canDrag && isStart && "cursor-grab",
                     isBeingDragged && isDragging && "cursor-grabbing",
+                    event.ownerColor && "pr-4",
                   )}
+                  aria-label={
+                    event.ownerName || event.overlayEmail
+                      ? `${event.title}, ${
+                          event.ownerName || event.overlayEmail
+                        }'s calendar`
+                      : event.title
+                  }
                   style={{
                     ...posStyle,
                     left: `${li.left}px`,
@@ -483,6 +512,13 @@ export function DayView({
                     opacity: isBeingDragged && isDragging ? 0.9 : undefined,
                   }}
                 >
+                  {event.ownerColor && (
+                    <span
+                      aria-hidden="true"
+                      className="absolute right-1.5 top-1.5 size-1.5 rounded-full ring-1 ring-background/70"
+                      style={{ backgroundColor: event.ownerColor }}
+                    />
+                  )}
                   {durationMin <= 30 ? (
                     <div className="flex items-baseline gap-1.5 truncate">
                       {allOthersOut && (

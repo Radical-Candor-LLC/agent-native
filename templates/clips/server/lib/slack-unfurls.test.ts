@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
+
 import { describe, expect, it, vi } from "vitest";
+
 import {
   buildChatUnfurlPayload,
   buildSlackVideoBlock,
@@ -214,7 +216,7 @@ describe("Clips Slack unfurls", () => {
     };
 
     await postSlackUnfurl({
-      token: "xoxb-example",
+      token: "example-bot-token",
       payload,
       fetchImpl: fetchImpl as any,
     });

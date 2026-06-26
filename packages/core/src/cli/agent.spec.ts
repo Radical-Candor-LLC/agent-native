@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import {
   createHeadlessBuiltinActions,
   parseAgentArgs,
@@ -53,5 +54,13 @@ describe("agent CLI", () => {
 
     const result = await entry.run({ slug: "agent-native-docs" });
     expect(result).toContain("node_modules/@agent-native/core/docs");
+  });
+
+  it("exposes source-search to the headless agent loop", async () => {
+    const actions = await createHeadlessBuiltinActions();
+    const entry = actions["source-search"];
+
+    expect(entry.readOnly).toBe(true);
+    expect(entry.tool.description).toContain("source corpus");
   });
 });

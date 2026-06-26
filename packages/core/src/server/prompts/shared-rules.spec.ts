@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import { sharedRule8 } from "./shared-rules.js";
 
 describe("shared framework prompt rules", () => {
@@ -33,5 +34,37 @@ describe("shared framework prompt rules", () => {
     expect(rule).not.toContain("db-query");
     expect(rule).not.toContain("db-exec");
     expect(rule).not.toContain("db-patch");
+  });
+
+  it("describes read-only database tools without advertising write tools", () => {
+    const rule = sharedRule8(
+      {
+        providerActions: ["github-search", "notion-search"],
+      },
+      { databaseTools: "read" },
+    );
+
+    expect(rule).toContain("Read-only `db-*` tools");
+    expect(rule).toContain("db-schema");
+    expect(rule).toContain("db-query");
+    expect(rule).toContain("typed app actions for writes");
+    expect(rule).toContain("db-exec");
+    expect(rule).toContain("db-patch");
+    expect(rule).toContain("not available");
+  });
+
+  it("omits extension management guidance when extension tools are disabled", () => {
+    const rule = sharedRule8(
+      {
+        providerActions: ["github-search", "notion-search"],
+      },
+      { extensionTools: false },
+    );
+
+    expect(rule).toContain("db-query");
+    expect(rule).not.toContain("list-extensions");
+    expect(rule).not.toContain("update-extension");
+    expect(rule).not.toContain("hide-extension");
+    expect(rule).not.toContain("delete-extension");
   });
 });

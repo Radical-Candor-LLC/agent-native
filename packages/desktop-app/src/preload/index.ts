@@ -1,5 +1,7 @@
-import { contextBridge, ipcRenderer } from "electron";
 import path from "node:path";
+
+import type { AppConfig, FrameSettings } from "@shared/app-registry";
+import type { CodeAgentPermissionMode } from "@shared/code-agents";
 import {
   IPC,
   type ActiveWebviewTarget,
@@ -34,6 +36,7 @@ import {
   type CodeAgentProviderSettingsUpdate,
   type CodeAgentProviderSettingsUpdateResult,
   type DesktopOpenRequest,
+  type DesktopShortcutActivationRequest,
   type DesktopShortcutSettings,
   type DesktopShortcutUpdateResult,
   type DesktopShortcutUpsertRequest,
@@ -41,8 +44,7 @@ import {
   type LocalAppFolderSelectResult,
   type UpdateStatus,
 } from "@shared/ipc-channels";
-import type { AppConfig, FrameSettings } from "@shared/app-registry";
-import type { CodeAgentPermissionMode } from "@shared/code-agents";
+import { contextBridge, ipcRenderer } from "electron";
 
 const CODE_AGENTS_SUBSCRIBE_TRANSCRIPT_CHANNEL =
   "code-agents:subscribe-transcript";
@@ -118,6 +120,19 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.SHORTCUTS_UPSERT, request),
     removeBinding: (id: string): Promise<DesktopShortcutUpdateResult> =>
       ipcRenderer.invoke(IPC.SHORTCUTS_REMOVE, id),
+    onActivate: (
+      cb: (request: DesktopShortcutActivationRequest) => void,
+    ): (() => void) => {
+      const handler = (
+        _: Electron.IpcRendererEvent,
+        request: DesktopShortcutActivationRequest,
+      ) => cb(request);
+      ipcRenderer.on(IPC.SHORTCUTS_ACTIVATE, handler);
+      return () => ipcRenderer.removeListener(IPC.SHORTCUTS_ACTIVATE, handler);
+    },
+    ackActivation: (requestId: string, appId?: string): void => {
+      ipcRenderer.send(IPC.SHORTCUTS_ACTIVATE_ACK, { requestId, appId });
+    },
   },
 
   /** App config management */

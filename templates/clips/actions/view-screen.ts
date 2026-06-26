@@ -11,14 +11,19 @@
  */
 
 import { defineAction } from "@agent-native/core";
-import { readAppState } from "@agent-native/core/application-state";
+import {
+  readAppState,
+  readAppStateForCurrentTab,
+} from "@agent-native/core/application-state";
+import { getRequestUserEmail } from "@agent-native/core/server/request-context";
+import { accessFilter } from "@agent-native/core/sharing";
 import { and, asc, desc, eq, gte, isNotNull, isNull, lte } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
-import { accessFilter } from "@agent-native/core/sharing";
-import { getRequestUserEmail } from "@agent-native/core/server/request-context";
 import {
   getActiveOrganizationId,
+  ownerEmailMatches,
   parseSpaceIds,
 } from "../server/lib/recordings.js";
 import { parseBrowserDiagnosticsRow } from "../shared/browser-diagnostics.js";
@@ -137,8 +142,6 @@ async function fetchLibrary(folderId?: string) {
   ];
   if (folderId) {
     conditions.push(eq(schema.recordings.folderId, folderId));
-  } else {
-    conditions.push(isNull(schema.recordings.folderId));
   }
   const rows = await db
     .select()
@@ -166,7 +169,7 @@ async function fetchFoldersForSpace(spaceId: string | null) {
     .from(schema.folders)
     .where(
       and(
-        eq(schema.folders.ownerEmail, ownerEmail),
+        ownerEmailMatches(schema.folders.ownerEmail, ownerEmail),
         spaceId
           ? eq(schema.folders.spaceId, spaceId)
           : isNull(schema.folders.spaceId),
@@ -427,12 +430,14 @@ export default defineAction({
   schema: z.object({}),
   http: false,
   run: async () => {
-    const navigation = (await readAppState(
+    // Scoped to the requesting browser tab so each tab exposes the clip IT is
+    // showing, falling back to the global key for CLI/external agents.
+    const navigation = (await readAppStateForCurrentTab(
       "navigation",
     )) as NavigationState | null;
     const playerState = await readAppState("player-state");
     const editorDraft = await readAppState("editor-draft");
-    const selection = await readAppState("selection");
+    const selection = await readAppStateForCurrentTab("selection");
     const organizationId = await getActiveOrganizationId();
     const recordIntent = await readAppState("record-intent");
     const recordingSetup = await readAppState("recording-setup");

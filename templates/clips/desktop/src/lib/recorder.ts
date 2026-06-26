@@ -50,13 +50,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
+
+import type { LocalRecordingMode } from "../shared/config";
 import { createAudioCue, type AudioCue } from "./audio-cue";
 import { createCameraCompositeStream } from "./camera-composite";
-import {
-  startTranscriptionCapture,
-  type CapturedTranscript,
-  type TranscriptionCapture,
-} from "./transcription-capture";
 import {
   createLocalRecordingFolderName,
   exportBlobChunksToLocalRecordingFile,
@@ -67,12 +64,23 @@ import {
   type LocalRecordingTarget,
 } from "./local-export";
 import { buildCaptureTitle, type CaptureTitleResult } from "./recording-title";
-import type { LocalRecordingMode } from "../shared/config";
+import {
+  startTranscriptionCapture,
+  type CapturedTranscript,
+  type TranscriptionCapture,
+} from "./transcription-capture";
 
 export type { LocalExportedFile } from "./local-export";
 
 export type CaptureMode = "screen" | "screen-camera" | "camera";
-export type CaptureSource = "full-screen" | "window";
+export type CaptureSource = "full-screen" | "window" | "region";
+
+export interface RegionCaptureRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
 const NATIVE_FULLSCREEN_RECORDING_FLAG = "clips:native-fullscreen-recording";
 const DEV_SYNTHETIC_CAPTURE_FLAG = "clips:dev-synthetic-capture";
@@ -81,9 +89,13 @@ const LIVE_UPLOAD_CHUNK_MS = 1_000;
 const CLOUD_CAPTURE_FRAME_RATE = 24;
 const CLOUD_CAPTURE_MAX_WIDTH = 1920;
 const CLOUD_CAPTURE_MAX_HEIGHT = 1080;
-const CLOUD_RECORDING_MAX_LONG_EDGE = 1280;
-const CLOUD_RECORDING_VIDEO_BITRATE_BPS = 900_000;
-const CLOUD_RECORDING_AUDIO_BITRATE_BPS = 96_000;
+// Crisp capture for the desktop browser MediaRecorder fallback. Files are no
+// longer shrunk client-side and the upload provider streams large files, so we
+// keep full 1080p (was downscaled to a 1280 long edge) and a sharp bitrate (was
+// 900 kbps, which left UI and text fuzzy). Dial down if file size matters.
+const CLOUD_RECORDING_MAX_LONG_EDGE = 1920;
+const CLOUD_RECORDING_VIDEO_BITRATE_BPS = 8_000_000;
+const CLOUD_RECORDING_AUDIO_BITRATE_BPS = 128_000;
 
 function isMacPlatform(): boolean {
   if (typeof navigator === "undefined") return false;
@@ -98,7 +110,7 @@ function isMacPlatform(): boolean {
 export function shouldUseNativeFullscreenRecording(
   source: CaptureSource | undefined,
 ): boolean {
-  if (source !== "full-screen") return false;
+  if (source !== "full-screen" && source !== "region") return false;
   if (typeof localStorage === "undefined") return false;
   const saved = localStorage.getItem(NATIVE_FULLSCREEN_RECORDING_FLAG);
   if (saved !== null) {
@@ -906,7 +918,7 @@ async function captureTitleForRecording(params: {
   return buildCaptureTitle({
     appName: context?.appName,
     windowTitle: context?.windowTitle,
-    displaySurface: params.source === "full-screen" ? "monitor" : "window",
+    displaySurface: params.source === "window" ? "window" : "monitor",
     mode: params.mode,
   });
 }
@@ -1265,12 +1277,126 @@ class CountdownCancelledError extends Error {
   }
 }
 
+class RegionSelectionCancelledError extends Error {
+  constructor() {
+    super("Recording region selection cancelled");
+    this.name = "AbortError";
+  }
+}
+
 function isCountdownCancelledError(err: unknown) {
   return (
     err instanceof Error &&
     err.name === "AbortError" &&
     /countdown/i.test(err.message)
   );
+}
+
+function isRegionSelectionCancelledError(err: unknown) {
+  return (
+    err instanceof Error &&
+    err.name === "AbortError" &&
+    /region selection/i.test(err.message)
+  );
+}
+
+function normalizeRegionCaptureRect(value: unknown): RegionCaptureRect | null {
+  if (!value || typeof value !== "object") return null;
+  const rect = value as Partial<RegionCaptureRect>;
+  const x = Number(rect.x);
+  const y = Number(rect.y);
+  const width = Number(rect.width);
+  const height = Number(rect.height);
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return null;
+  }
+  return { x, y, width, height };
+}
+
+function waitForRegionSelection(): {
+  promise: Promise<RegionCaptureRect>;
+  cleanup: () => void;
+} {
+  let settled = false;
+  const unlistens: UnlistenFn[] = [];
+
+  const cleanup = () => {
+    settled = true;
+    for (const unlisten of unlistens.splice(0)) {
+      try {
+        unlisten();
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const promise = new Promise<RegionCaptureRect>((resolve, reject) => {
+    const finish = (result: RegionCaptureRect | null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (result) resolve(result);
+      else reject(new RegionSelectionCancelledError());
+    };
+
+    const track = (listener: Promise<UnlistenFn>) => {
+      listener
+        .then((unlisten) => {
+          if (settled) {
+            try {
+              unlisten();
+            } catch {
+              // ignore
+            }
+            return;
+          }
+          unlistens.push(unlisten);
+        })
+        .catch((err) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(err);
+        });
+    };
+
+    track(
+      listen<unknown>("clips:region-capture-selected", (event) => {
+        const rect = normalizeRegionCaptureRect(event.payload);
+        if (!rect) {
+          finish(null);
+          return;
+        }
+        finish(rect);
+      }),
+    );
+    track(
+      listen("clips:region-capture-cancelled", () => {
+        finish(null);
+      }),
+    );
+  });
+
+  return { promise, cleanup };
+}
+
+async function selectRegionForRecording(): Promise<RegionCaptureRect> {
+  const selection = waitForRegionSelection();
+  try {
+    await invoke("show_region_capture_selector");
+    return await selection.promise;
+  } catch (err) {
+    selection.cleanup();
+    throw err;
+  }
 }
 
 function waitForCountdownEvent(timeoutMs = 4000): Promise<void> {
@@ -1346,7 +1472,27 @@ async function showRegionGuidesForRecording(wantsScreen: boolean) {
   });
 }
 
+// Frame the chosen screen region with a live border so the user can see exactly
+// what's being captured throughout the countdown and recording. The overlay is
+// capture-excluded and draws its stroke outside the captured pixels, so it never
+// lands in the video. Torn down with the rest of the recording chrome on stop.
+async function showRegionRecordBorder(region: RegionCaptureRect | null) {
+  if (!region) return;
+  await invoke("show_region_record_border", {
+    x: region.x,
+    y: region.y,
+    width: region.width,
+    height: region.height,
+  }).catch((err) => {
+    console.warn("[clips-recorder] show_region_record_border failed:", err);
+  });
+}
+
 async function runRecordingCountdown(wantsScreen: boolean) {
+  // The recording-start chime is intentionally NOT played here. It fires from
+  // `audioCue.playBeforeCapture()` at the real capture-start (right before the
+  // recorder/native capture is kicked off) so the beep lines up with the moment
+  // recording actually begins — not one second early on the countdown's "1".
   const countdownEvent = waitForCountdownEvent(COUNTDOWN_EVENT_TIMEOUT_MS);
   await showRegionGuidesForRecording(wantsScreen);
   try {
@@ -1409,6 +1555,7 @@ async function startNativeFullscreenRecording(
   let localCameraStream: MediaStream | null = null;
   let localOwnsCameraStream = false;
   let bubbleCaptureExcluded = false;
+  let captureRegion: RegionCaptureRect | null = null;
   let transcriptionCapture: TranscriptionCapture | null = null;
   // Timer baseline for the toolbar/pill elapsed clock. Stamped the instant
   // native capture goes live (right after the start invoke resolves), not after
@@ -1430,6 +1577,14 @@ async function startNativeFullscreenRecording(
   try {
     await invoke("park_popover_offscreen").catch(() => {});
     emit("clips:popover-visible", false).catch(() => {});
+
+    if (params.source === "region") {
+      captureRegion = await selectRegionForRecording();
+      // Frame the selected area now so it stays visible through the countdown
+      // and the whole recording. hide_recording_chrome / hide_overlays tear it
+      // down on stop, cancel, and the error paths below.
+      await showRegionRecordBorder(captureRegion);
+    }
 
     if (localOnly && localRecordingMode === "separate" && wantsCamera) {
       localCameraStream =
@@ -1505,6 +1660,7 @@ async function startNativeFullscreenRecording(
       captureSystemAudio: wantsSystemAudio,
       micDeviceId: params.micId || null,
       micDeviceLabel,
+      captureRegion,
     };
     // Warm the mic DURING the countdown. ScreenCaptureKit delivers its first
     // mic sample ~1s after capture starts; warming now lets `begin` attach the
@@ -1525,7 +1681,7 @@ async function startNativeFullscreenRecording(
     } else {
       const captureTitle = await captureTitleForRecording({
         mode: params.mode,
-        source: "full-screen",
+        source: params.source,
       });
       console.time("[clips-recorder] createServerRecording duration");
       const recordingPromise = createServerRecording(
@@ -2795,6 +2951,11 @@ async function startRecordingInner(
         );
       }
       await thumbnailUploadPromise;
+
+      if (popoverOwnsCamera) {
+        console.log("[clips-recorder] releasing popover camera");
+        emit("clips:release-camera").catch(() => {});
+      }
 
       const videoSettings = uploadPrimaryVideo.stream
         .getVideoTracks()[0]

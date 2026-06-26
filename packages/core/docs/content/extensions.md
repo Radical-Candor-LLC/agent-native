@@ -17,6 +17,11 @@ Three things make extensions work:
 - **Full access to the template's data.** Extensions can call the same actions the agent calls — `list-emails` in Mail, `list-decks` in Slides, `list-recordings` in Clips — so they have everything the host app has.
 - **Built-in storage.** Each extension has its own per-user / per-org key-value store, so it can save state without you adding a new SQL table.
 
+If a template should not expose user-authored extensions, set
+`extensionTools: false` on `createAgentChatPlugin()`. That removes the
+agent-facing extension actions and prompt guidance while leaving the rest of the
+app agent intact.
+
 ```an-diagram title="The sandbox bridge" summary="Extension HTML runs in an isolated iframe and reaches the host only through a fixed set of bridge helpers — every call is scoped and access-checked."
 {
   "html": "<div class=\"ext-bridge\"><div class=\"diagram-card sandbox\" data-rough><span class=\"diagram-pill warn\">Sandboxed iframe</span><small class=\"diagram-muted\">Alpine.js HTML &middot; no host cookies, session, or DOM</small><div class=\"ext-helpers\"><span class=\"diagram-pill\">appAction</span><span class=\"diagram-pill\">appFetch</span><span class=\"diagram-pill\">dbQuery / dbExec</span><span class=\"diagram-pill\">extensionData</span><span class=\"diagram-pill\">extensionFetch</span></div></div><div class=\"diagram-arrow diagram-accent\" aria-hidden=\"true\">&harr;</div><div class=\"diagram-col\"><div class=\"diagram-box\">Host template<br><small class=\"diagram-muted\">actions, auto-scoped SQL</small></div><div class=\"diagram-box\">Secret proxy<br><small class=\"diagram-muted\"><code>${keys.NAME}</code>, domain-locked</small></div><div class=\"diagram-box\">External APIs<br><small class=\"diagram-muted\">via extensionFetch only</small></div></div></div>",
@@ -182,6 +187,85 @@ Three rules of thumb:
   // List everything visible to me (mine + org)
   const all = await extensionData.list('notes', { scope: 'all' });
 </script>
+```
+
+### Authenticated Extension Data API {#authenticated-extension-data-api}
+
+The same store is also available through authenticated framework routes when
+another logged-in client needs to read or update the data an extension uses.
+These endpoints use the caller's normal app session and the extension's sharing
+roles; they are not a public or server-to-server API key surface. If you need
+third-party ingestion, define a template action or route with its own scoped key
+model, like Analytics does for `/track`.
+
+```an-api title="List extension data" method="GET" path="/_agent-native/extensions/data/:extensionId/:collection"
+{
+  "method": "GET",
+  "path": "/_agent-native/extensions/data/:extensionId/:collection",
+  "summary": "List rows in one extensionData collection",
+  "description": "`scope=user` reads only the caller's private rows. `scope=org` reads organization-shared rows. `scope=all` reads both the caller's private rows and org rows visible in the current org context. Results are capped by `limit` with a default of 100 and a max of 1000.",
+  "auth": "Authenticated session; requires viewer role on the extension.",
+  "params": [
+    { "name": "extensionId", "in": "path", "type": "string", "required": true, "description": "Extension id." },
+    { "name": "collection", "in": "path", "type": "string", "required": true, "description": "Collection name passed to `extensionData.list()`." },
+    { "name": "scope", "in": "query", "type": "\"user\" | \"org\" | \"all\"", "required": false, "description": "Read user-private rows, org-shared rows, or both. Defaults to `user`." },
+    { "name": "limit", "in": "query", "type": "number", "required": false, "description": "Maximum rows to return. Defaults to 100 and clamps to 1-1000." }
+  ],
+  "responses": [
+    { "status": "200", "description": "Array of rows with id, tool_id, collection, data, owner_email, scope, org_id, created_at, and updated_at.", "example": "[{\"id\":\"note-1\",\"tool_id\":\"ext_123\",\"collection\":\"notes\",\"data\":\"{\\\"title\\\":\\\"Team note\\\"}\",\"owner_email\":\"ada@example.com\",\"scope\":\"org\",\"org_id\":\"org_123\",\"created_at\":\"2026-06-25T12:00:00.000Z\",\"updated_at\":\"2026-06-25T12:00:00.000Z\"}]" },
+    { "status": "400", "description": "`scope=org` was requested without an org context." },
+    { "status": "404", "description": "Extension not found, or the caller has no access to it." }
+  ]
+}
+```
+
+```an-api title="Upsert extension data" method="POST" path="/_agent-native/extensions/data/:extensionId/:collection"
+{
+  "method": "POST",
+  "path": "/_agent-native/extensions/data/:extensionId/:collection",
+  "summary": "Create or update one extensionData item",
+  "description": "Writes one item to the extension's isolated key-value store. The uniqueness key is extension id, collection, scope, and item id. Objects are stored as JSON strings so the extension bridge can read them back consistently.",
+  "auth": "Authenticated session; requires editor, admin, or owner role on the extension.",
+  "params": [
+    { "name": "extensionId", "in": "path", "type": "string", "required": true, "description": "Extension id." },
+    { "name": "collection", "in": "path", "type": "string", "required": true, "description": "Collection name passed to `extensionData.set()`." },
+    { "name": "id", "in": "body", "type": "string", "required": false, "description": "Stable item id. If omitted, the server generates a UUID." },
+    { "name": "scope", "in": "body", "type": "\"user\" | \"org\"", "required": false, "description": "Write a user-private item or an org-shared item. Defaults to `user`." },
+    { "name": "data", "in": "body", "type": "object | string", "required": true, "description": "Value to persist. Objects are JSON-stringified before storage." }
+  ],
+  "request": {
+    "contentType": "application/json",
+    "example": "{\n  \"id\": \"note-1\",\n  \"scope\": \"org\",\n  \"data\": { \"title\": \"Team note\" }\n}"
+  },
+  "responses": [
+    { "status": "200", "description": "The written item summary.", "example": "{\"id\":\"note-1\",\"extensionId\":\"ext_123\",\"collection\":\"notes\",\"data\":\"{\\\"title\\\":\\\"Team note\\\"}\",\"ownerEmail\":\"ada@example.com\",\"scope\":\"org\",\"orgId\":\"org_123\",\"createdAt\":\"2026-06-25T12:00:00.000Z\",\"updatedAt\":\"2026-06-25T12:00:00.000Z\"}" },
+    { "status": "400", "description": "`data` is missing, or `scope=org` was requested without an org context." },
+    { "status": "403", "description": "Caller can view the extension but does not have editor-level access." },
+    { "status": "404", "description": "Extension not found, or the caller has no access to it." }
+  ]
+}
+```
+
+```an-api title="Delete extension data" method="DELETE" path="/_agent-native/extensions/data/:extensionId/:collection/:itemId"
+{
+  "method": "DELETE",
+  "path": "/_agent-native/extensions/data/:extensionId/:collection/:itemId",
+  "summary": "Delete one extensionData item",
+  "description": "Deletes the matching item from the selected scope. The default scope is `user`, which deletes only the caller's private item. Use `scope=org` to delete an org-shared item in the current org context.",
+  "auth": "Authenticated session; requires editor, admin, or owner role on the extension.",
+  "params": [
+    { "name": "extensionId", "in": "path", "type": "string", "required": true, "description": "Extension id." },
+    { "name": "collection", "in": "path", "type": "string", "required": true, "description": "Collection name passed to `extensionData.remove()`." },
+    { "name": "itemId", "in": "path", "type": "string", "required": true, "description": "Item id to delete." },
+    { "name": "scope", "in": "query", "type": "\"user\" | \"org\"", "required": false, "description": "Delete from user-private or org-shared storage. Defaults to `user`." }
+  ],
+  "responses": [
+    { "status": "200", "description": "Delete completed.", "example": "{\"ok\":true}" },
+    { "status": "400", "description": "`scope=org` was requested without an org context." },
+    { "status": "403", "description": "Caller can view the extension but does not have editor-level access." },
+    { "status": "404", "description": "Extension not found, or the caller has no access to it." }
+  ]
+}
 ```
 
 External APIs go through `extensionFetch`, which proxies the call server-side and substitutes secrets via the `${keys.NAME}` template:
